@@ -407,7 +407,7 @@ fn handle_pipe_client(
     if let Err(msg) = verify_pipe_caller_process(pipe, service_exe) {
         let resp = ServiceResponse::Error { message: msg };
         let _ = writeln!(
-            &mut **file,
+            &mut *file,
             "{}",
             serde_json::to_string(&resp).unwrap_or_default()
         );
@@ -417,7 +417,7 @@ fn handle_pipe_client(
     // Bounded read_line (MAX_CONFIG_BYTES + 64 KiB) to prevent OOM DoS (M-1)
     let mut line = String::new();
     {
-        let limited = (&**file).take((MAX_CONFIG_BYTES + 65536) as u64);
+        let limited = (&*file).take((MAX_CONFIG_BYTES + 65536) as u64);
         let mut reader = BufReader::new(limited);
         if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
             return;
@@ -431,7 +431,7 @@ fn handle_pipe_client(
                 message: format!("invalid IPC request: {e}"),
             };
             let _ = writeln!(
-                &mut **file,
+                &mut *file,
                 "{}",
                 serde_json::to_string(&resp).unwrap_or_default()
             );
@@ -496,7 +496,7 @@ fn handle_pipe_client(
     };
 
     if let Ok(encoded) = serde_json::to_string(&resp) {
-        let _ = writeln!(&mut **file, "{encoded}");
+        let _ = writeln!(&mut *file, "{encoded}");
     }
 }
 
