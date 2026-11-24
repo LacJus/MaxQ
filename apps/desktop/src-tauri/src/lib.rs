@@ -651,7 +651,9 @@ async fn start_proxy(
     }
     {
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
-        let _ = sp.disable_and_restore();
+        if sp.disable_and_restore().is_err() {
+            let _ = sp.force_disable();
+        }
     }
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
     if let Ok(mut guard) = state.clash_api_session.lock() {
@@ -718,9 +720,17 @@ async fn start_proxy(
 
     let mut status = sup.status();
     if enable_system_proxy {
-        let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
-        sp.enable(policy.mixed_listen_port, &profile.general.skip_proxy)
-            .map_err(|e| e.to_string())?;
+        let enable_res = {
+            let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
+            sp.enable(policy.mixed_listen_port, &profile.general.skip_proxy)
+        };
+        if let Err(e) = enable_res {
+            let _ = sup.stop().await;
+            if let Ok(mut guard) = state.clash_api_session.lock() {
+                *guard = None;
+            }
+            return Err(format!("启用 Windows 系统代理失败：{e}"));
+        }
         status.system_proxy_enabled = true;
     }
     Ok(status)
@@ -728,10 +738,16 @@ async fn start_proxy(
 
 #[tauri::command]
 async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    {
+    let sysproxy_err: Option<String> = {
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
-        let _ = sp.disable_and_restore();
-    }
+        match sp.disable_and_restore() {
+            Ok(()) => None,
+            Err(first_err) => match sp.force_disable() {
+                Ok(()) => None,
+                Err(second_err) => Some(format!("{first_err}；强制清除亦失败：{second_err}")),
+            },
+        }
+    };
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
@@ -744,7 +760,34 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
     let mut status = sup.status();
     status.system_proxy_enabled = false;
     status.tun_active = false;
+    if let Some(err) = sysproxy_err {
+        return Err(format!("已停止代理内核，但关闭 Windows 系统代理失败：{err}"));
+    }
     Ok(status)
+}
+
+/// Emergency 1-click recovery command: stops any running proxy/TUN instance and
+/// unconditionally clears Windows System Proxy (`PROXY_TYPE_DIRECT` + `ProxyEnable=0`)
+/// across LAN and PPPoE/RAS entries, then broadcasts WinINet refresh.
+#[tauri::command]
+async fn reset_system_proxy(state: State<'_, AppState>) -> Result<String, String> {
+    let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+    if let Ok(mut guard) = state.tun_active_node.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.clash_api_session.lock() {
+        *guard = None;
+    }
+    {
+        let mut sup = state.supervisor.lock().await;
+        let _ = sup.stop().await;
+    }
+    {
+        let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
+        sp.force_disable()
+            .map_err(|e| format!("强制关闭 Windows 系统代理失败：{e}"))?;
+    }
+    Ok("已强制关闭 Windows 系统代理并刷新 WinINet 网络配置，浏览器可立即直连恢复。".to_string())
 }
 
 /// Queries the local loopback Clash API (`/connections`) strictly from Rust with Bearer auth
@@ -998,6 +1041,36 @@ fn resolve_bundled_binary(app: &tauri::App, bin_name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Unified, idempotent runtime teardown executed on tray quit, window close/destroy,
+/// and Tauri `RunEvent::ExitRequested` / `RunEvent::Exit` (including OS logoff/shutdown).
+fn cleanup_all_runtime(app_handle: &tauri::AppHandle) {
+    let state = app_handle.state::<AppState>();
+
+    if let Ok(mut sp) = state.sysproxy.lock() {
+        if sp.disable_and_restore().is_err() {
+            let _ = sp.force_disable();
+        }
+    }
+
+    let _ = TunServiceClient::stop_tun();
+
+    if let Ok(mut guard) = state.tun_active_node.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.clash_api_session.lock() {
+        *guard = None;
+    }
+
+    if let Ok(mut sup) = state.supervisor.try_lock() {
+        sup.stop_sync();
+    } else {
+        tauri::async_runtime::block_on(async {
+            let mut sup = state.supervisor.lock().await;
+            sup.stop_sync();
+        });
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1013,7 +1086,9 @@ pub fn run() {
 
             let runtime_dir = data_dir.join("runtime");
             let mut sysproxy = SystemProxyManager::new(&runtime_dir);
-            let _ = sysproxy.recover_if_dirty();
+            if sysproxy.recover_if_dirty().is_err() {
+                let _ = sysproxy.force_disable();
+            }
 
             let singbox_name = if cfg!(windows) {
                 "sing-box.exe"
@@ -1034,11 +1109,18 @@ pub fn run() {
                 clash_api_session: Mutex::new(None),
             });
 
-            // Build system tray for quick show/hide and clean quit
+            // Build system tray for quick show/hide, emergency proxy reset, and clean quit
             let show_item = MenuItem::with_id(app, "show", "打开 MaxQ", true, None::<&str>)?;
+            let reset_proxy_item = MenuItem::with_id(
+                app,
+                "reset_proxy",
+                "强制关闭系统代理（恢复直连）",
+                true,
+                None::<&str>,
+            )?;
             let quit_item =
                 MenuItem::with_id(app, "quit", "断开并退出 MaxQ", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&show_item, &reset_proxy_item, &quit_item])?;
 
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
@@ -1050,12 +1132,15 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => {
+                    "reset_proxy" => {
+                        cleanup_all_runtime(app_handle);
                         let state = app_handle.state::<AppState>();
                         if let Ok(mut sp) = state.sysproxy.lock() {
-                            let _ = sp.disable_and_restore();
-                        };
-                        let _ = TunServiceClient::stop_tun();
+                            let _ = sp.force_disable();
+                        }
+                    }
+                    "quit" => {
+                        cleanup_all_runtime(app_handle);
                         app_handle.exit(0);
                     }
                     _ => {}
@@ -1081,12 +1166,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                let state = window.state::<AppState>();
-                if let Ok(mut sp) = state.sysproxy.lock() {
-                    let _ = sp.disable_and_restore();
-                };
-                let _ = TunServiceClient::stop_tun();
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                cleanup_all_runtime(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1112,6 +1196,7 @@ pub fn run() {
             set_insecure_override,
             start_proxy,
             stop_proxy,
+            reset_system_proxy,
             get_runtime_telemetry,
             close_all_connections,
             get_runtime_status,
@@ -1119,6 +1204,14 @@ pub fn run() {
             get_runtime_policy,
             update_runtime_policy,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running MaxQ desktop application");
+        .build(tauri::generate_context!())
+        .expect("error while building MaxQ desktop application")
+        .run(|app_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                cleanup_all_runtime(app_handle);
+            }
+        });
 }

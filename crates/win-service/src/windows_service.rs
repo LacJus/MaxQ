@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,6 +30,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -53,8 +59,58 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const MAX_LOGS: usize = 400;
 const PIPE_IO_TIMEOUT_MS: u32 = 10_000;
 
+struct ServiceChildJobGuard(HANDLE);
+
+unsafe impl Send for ServiceChildJobGuard {}
+unsafe impl Sync for ServiceChildJobGuard {}
+
+impl ServiceChildJobGuard {
+    fn assign_kill_on_close(proc_handle: HANDLE) -> Option<Self> {
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok_set = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok_set == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+        let ok_assign = unsafe { AssignProcessToJobObject(job, proc_handle) };
+        if ok_assign == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+        Some(Self(job))
+    }
+}
+
+impl Drop for ServiceChildJobGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+            self.0 = null_mut();
+        }
+    }
+}
+
 struct ServiceRuntimeState {
     child: Option<Child>,
+    job_guard: Option<ServiceChildJobGuard>,
     singbox_pid: Option<u32>,
     logs: Arc<Mutex<VecDeque<String>>>,
     last_mitm_alert: Arc<Mutex<Option<String>>>,
@@ -64,6 +120,7 @@ impl ServiceRuntimeState {
     fn new() -> Self {
         Self {
             child: None,
+            job_guard: None,
             singbox_pid: None,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOGS))),
             last_mitm_alert: Arc::new(Mutex::new(None)),
@@ -75,6 +132,7 @@ impl ServiceRuntimeState {
             let _ = c.kill();
             let _ = c.wait();
         }
+        self.job_guard.take();
         self.singbox_pid = None;
     }
 
@@ -84,6 +142,7 @@ impl ServiceRuntimeState {
                 Ok(None) => return true,
                 _ => {
                     self.child = None;
+                    self.job_guard.take();
                     self.singbox_pid = None;
                 }
             }
@@ -825,6 +884,7 @@ fn start_hardened_singbox_tun(
         .map_err(|e| format!("failed to spawn sing-box.exe: {e}"))?;
 
     let pid = child.id();
+    let job_guard = ServiceChildJobGuard::assign_kill_on_close(child.as_raw_handle() as HANDLE);
 
     if let Some(stdout) = child.stdout.take() {
         spawn_service_log_thread(stdout, Arc::clone(&logs_arc), Arc::clone(&alert_arc));
@@ -847,6 +907,7 @@ fn start_hardened_singbox_tun(
 
     let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
     rt.child = Some(child);
+    rt.job_guard = job_guard;
     rt.singbox_pid = Some(pid);
     Ok(pid)
 }

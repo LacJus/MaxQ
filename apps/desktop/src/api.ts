@@ -79,6 +79,8 @@ export const api = {
 
   stopProxy: () => invoke<RuntimeStatus>("stop_proxy"),
 
+  resetSystemProxy: () => invoke<string>("reset_system_proxy"),
+
   getRuntimeStatus: () => invoke<RuntimeStatus>("get_runtime_status"),
 
   getRuntimeTelemetry: () => invoke<RuntimeTelemetry>("get_runtime_telemetry"),

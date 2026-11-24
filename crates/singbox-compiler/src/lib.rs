@@ -203,6 +203,7 @@ fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
     if enable_tun {
         let mut excluded: Vec<String> = vec![
             "127.0.0.0/8".into(),
+            "::1/128".into(),
             "10.0.0.0/8".into(),
             "172.16.0.0/12".into(),
             "192.168.0.0/16".into(),

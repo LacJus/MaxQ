@@ -578,6 +578,33 @@ export default function App() {
     }
   };
 
+  const handleResetSystemProxy = async () => {
+    if (!inTauri) {
+      showToast("ok", "（预览模式）已模拟强制关闭 Windows 系统代理并刷新 WinINet");
+      return;
+    }
+    try {
+      const msg = await api.resetSystemProxy();
+      const st = await api.getRuntimeStatus();
+      setStatus(st);
+      setTelemetry({
+        connected: false,
+        upload_bps: 0,
+        download_bps: 0,
+        upload_total: 0,
+        download_total: 0,
+        active_connections: 0,
+        uptime_secs: 0,
+        dynamic_pressure_q: 0,
+        recent_connections: [],
+      });
+      if (soundEnabled) playSoftTone("disconnect");
+      showToast("ok", msg);
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
   const handleCloseConnections = async () => {
     if (!inTauri) return;
     try {
@@ -1915,6 +1942,35 @@ export default function App() {
                     保存并应用策略
                   </button>
                 </div>
+              </section>
+
+              {/* Emergency System Proxy & WinINet Network Recovery */}
+              <section className="mq-panel flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
+                <div className="max-w-lg">
+                  <div className="flex items-center gap-2">
+                    <RefreshCw className="h-4 w-4" style={{ color: "var(--mq-accent)" }} />
+                    <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
+                      系统代理与网络恢复
+                    </h2>
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--mq-ink-2)" }}>
+                    强制停止代理内核并同步清除 Windows 注册表与 WinINet（
+                    <code className="font-mono-tabular">DefaultConnectionSettings</code>
+                    ）残留代理项，立即恢复浏览器直连联网。
+                  </p>
+                </div>
+                <button
+                  onClick={handleResetSystemProxy}
+                  className="mq-btn flex items-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-semibold"
+                  style={{
+                    backgroundColor: "var(--mq-danger-bg)",
+                    borderColor: "var(--mq-danger-border)",
+                    color: "var(--mq-danger)",
+                  }}
+                >
+                  <Power className="h-3.5 w-3.5" />
+                  一键强制关闭系统代理（网络恢复）
+                </button>
               </section>
             </div>
           )}

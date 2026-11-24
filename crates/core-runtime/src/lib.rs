@@ -86,12 +86,80 @@ impl Default for RuntimeStatus {
 
 const MAX_LOG_RING: usize = 500;
 
+#[cfg(windows)]
+struct ChildJobGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for ChildJobGuard {}
+#[cfg(windows)]
+unsafe impl Sync for ChildJobGuard {}
+
+#[cfg(windows)]
+impl ChildJobGuard {
+    /// Creates an anonymous Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// and binds `proc_handle` to it so the OS kernel unconditionally terminates `sing-box.exe`
+    /// whenever the guard is dropped or the parent MaxQ process exits/crashes.
+    fn assign_kill_on_close(proc_handle: windows_sys::Win32::Foundation::HANDLE) -> Option<Self> {
+        use std::ffi::c_void;
+        use std::ptr::null;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok_set = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok_set == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+        let ok_assign = unsafe { AssignProcessToJobObject(job, proc_handle) };
+        if ok_assign == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+        Some(Self(job))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJobGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Supervises the external `sing-box` process with restricted config permissions,
-/// log redaction, and real-time SPKI pin mismatch interception.
+/// log redaction, Windows Job Object crash-safety, and real-time SPKI pin mismatch interception.
 pub struct SingBoxSupervisor {
     singbox_path: PathBuf,
     runtime_dir: PathBuf,
     child: Option<Child>,
+    #[cfg(windows)]
+    job_guard: Option<ChildJobGuard>,
     clash_api_secret: Option<String>,
     status: Arc<Mutex<RuntimeStatus>>,
     logs: Arc<Mutex<VecDeque<String>>>,
@@ -105,6 +173,8 @@ impl SingBoxSupervisor {
             singbox_path,
             runtime_dir,
             child: None,
+            #[cfg(windows)]
+            job_guard: None,
             clash_api_secret: None,
             status: Arc::new(Mutex::new(RuntimeStatus::default())),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_RING))),
@@ -167,6 +237,11 @@ impl SingBoxSupervisor {
             .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
         let pid = child.id().unwrap_or(0);
 
+        #[cfg(windows)]
+        let job_guard = child.raw_handle().and_then(|h| {
+            ChildJobGuard::assign_kill_on_close(h as windows_sys::Win32::Foundation::HANDLE)
+        });
+
         if let Some(stdout) = child.stdout.take() {
             spawn_log_reader(
                 stdout,
@@ -187,6 +262,10 @@ impl SingBoxSupervisor {
         }
 
         self.child = Some(child);
+        #[cfg(windows)]
+        {
+            self.job_guard = job_guard;
+        }
         self.clash_api_secret = Some(compiled.clash_api_secret.clone());
 
         {
@@ -210,9 +289,18 @@ impl SingBoxSupervisor {
     }
 
     pub async fn stop(&mut self) -> Result<(), RuntimeError> {
+        let mut had_child = false;
+        let mut exit_code = None;
         if let Some(mut child) = self.child.take() {
+            had_child = true;
             let _ = child.kill().await;
-            let exit_code = child.wait().await.ok().and_then(|s| s.code());
+            exit_code = child.wait().await.ok().and_then(|s| s.code());
+        }
+        #[cfg(windows)]
+        {
+            self.job_guard.take();
+        }
+        if had_child {
             {
                 let mut st = self.status.lock().unwrap();
                 st.running = false;
@@ -222,6 +310,35 @@ impl SingBoxSupervisor {
             let _ = self.events_tx.send(RuntimeEvent::Stopped { exit_code });
         }
         Ok(())
+    }
+
+    /// Synchronous best-effort termination for app shutdown, tray quit, and `Drop` paths
+    /// where awaiting an async runtime is unsafe or unavailable.
+    pub fn stop_sync(&mut self) {
+        let mut had_child = false;
+        if let Some(mut child) = self.child.take() {
+            had_child = true;
+            let _ = child.start_kill();
+        }
+        #[cfg(windows)]
+        {
+            // Dropping the KILL_ON_JOB_CLOSE handle forces Windows kernel to terminate sing-box immediately
+            self.job_guard.take();
+        }
+        if had_child {
+            if let Ok(mut st) = self.status.lock() {
+                st.running = false;
+                st.pid = None;
+            }
+            self.clash_api_secret = None;
+            let _ = self.events_tx.send(RuntimeEvent::Stopped { exit_code: None });
+        }
+    }
+}
+
+impl Drop for SingBoxSupervisor {
+    fn drop(&mut self) {
+        self.stop_sync();
     }
 }
 
