@@ -746,9 +746,27 @@ export default function App() {
               </div>
 
               <div>
-                <label className="text-xs text-slate-400">
-                  粘贴分享链（可多行）、Base64 订阅内容或 `.conf` 全文
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-slate-400">
+                    粘贴分享链（可多行）、Base64 订阅内容或 `.conf` 全文
+                  </label>
+                  <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-cyan-300 hover:bg-slate-700">
+                    选择本地 .conf / 文件
+                    <input
+                      type="file"
+                      accept=".conf,.txt,.json,.yaml,.yml"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        const text = await file.text();
+                        setImportText(text);
+                        setImportName(file.name.replace(/\.[^.]+$/, ""));
+                        setPreview(null);
+                      }}
+                    />
+                  </label>
+                </div>
                 <textarea
                   rows={6}
                   value={importText}

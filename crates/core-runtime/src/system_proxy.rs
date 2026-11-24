@@ -107,7 +107,7 @@ pub fn build_windows_bypass_string(extra_bypass: &[String]) -> String {
 
 #[cfg(windows)]
 mod platform {
-    use std::ptr::null_mut;
+    use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
@@ -123,8 +123,8 @@ mod platform {
 
     fn notify_wininet() {
         unsafe {
-            InternetSetOptionW(null_mut(), INTERNET_OPTION_SETTINGS_CHANGED, null_mut(), 0);
-            InternetSetOptionW(null_mut(), INTERNET_OPTION_REFRESH, null_mut(), 0);
+            InternetSetOptionW(null_mut(), INTERNET_OPTION_SETTINGS_CHANGED, null(), 0);
+            InternetSetOptionW(null_mut(), INTERNET_OPTION_REFRESH, null(), 0);
         }
     }
 

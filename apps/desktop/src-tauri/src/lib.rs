@@ -282,6 +282,14 @@ pub fn run() {
             });
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let state = window.state::<AppState>();
+                if let Ok(mut sp) = state.sysproxy.lock() {
+                    let _ = sp.disable_and_restore();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             preview_import,
             commit_import,
