@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -244,6 +244,10 @@ export default function App() {
   const [batchPinning, setBatchPinning] = useState(false);
   const [tunBusy, setTunBusy] = useState(false);
   const [toast, setToast] = useState<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
+  const pollInFlightRef = useRef(false);
+  const proxyBusyRef = useRef(false);
+  const wasRunningRef = useRef(false);
+  const userStopRef = useRef(false);
 
   // Import Modal State
   const [importOpen, setImportOpen] = useState(false);
@@ -325,6 +329,7 @@ export default function App() {
         api.getTunServiceStatus(),
         api.getAboutInfo(),
       ]);
+      wasRunningRef.current = st.running;
       setProfiles(list);
       setStatus(st);
       setPolicy(pol);
@@ -356,6 +361,8 @@ export default function App() {
     refreshAll();
     if (!inTauri) return;
     const timer = setInterval(async () => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
         const [st, l, tunSt, tel] = await Promise.all([
           api.getRuntimeStatus(),
@@ -363,6 +370,16 @@ export default function App() {
           api.getTunServiceStatus(),
           api.getRuntimeTelemetry(),
         ]);
+        if (wasRunningRef.current && !st.running && !userStopRef.current && !proxyBusyRef.current) {
+          showToast(
+            "err",
+            "检测到代理内核意外退出，MaxQ 已自动关闭 Windows 系统代理以保护正常联网，请前往「运行日志」排查原因。"
+          );
+        }
+        wasRunningRef.current = st.running;
+        if (!st.running) {
+          userStopRef.current = false;
+        }
         setStatus(st);
         setLogs(l);
         setTunService(tunSt);
@@ -376,6 +393,8 @@ export default function App() {
         ]);
       } catch {
         // ignore transient poll error
+      } finally {
+        pollInFlightRef.current = false;
       }
     }, 1800);
     return () => clearInterval(timer);
@@ -416,6 +435,20 @@ export default function App() {
 
   const applyPolicyChange = async (patch: Partial<RuntimePolicy>, reconnectIfRunning = true) => {
     const nextPolicy: RuntimePolicy = { ...policy, ...patch };
+    const mp = nextPolicy.mixed_listen_port;
+    const cp = nextPolicy.clash_api_port;
+    if (!Number.isInteger(mp) || mp < 1024 || mp > 65535) {
+      showToast("err", "Mixed 代理端口必须为 1024–65535 之间的整数");
+      return;
+    }
+    if (!Number.isInteger(cp) || cp < 1024 || cp > 65535) {
+      showToast("err", "Clash API 端口必须为 1024–65535 之间的整数");
+      return;
+    }
+    if (mp === cp) {
+      showToast("err", `Mixed 代理端口与 Clash API 端口不能同为 ${mp}`);
+      return;
+    }
     setPolicy(nextPolicy);
     if (!inTauri) return;
     try {
@@ -427,6 +460,7 @@ export default function App() {
           status.active_node_id,
           saved.proxy_mode === "system_proxy"
         );
+        wasRunningRef.current = st.running;
         setStatus(st);
         showToast("ok", "策略已热更新并重新应用到运行中内核");
       } else {
@@ -535,13 +569,16 @@ export default function App() {
   };
 
   const handleStartNode = async (node: NodeConfig) => {
-    if (!profile) return;
+    if (!profile || proxyBusyRef.current) return;
+    proxyBusyRef.current = true;
+    userStopRef.current = false;
     try {
       const st = await api.startProxy(
         profile.id,
         node.id,
         policy.proxy_mode === "system_proxy"
       );
+      wasRunningRef.current = st.running;
       setStatus(st);
       if (soundEnabled) playSoftTone("connect");
       showToast("ok", `已通过 ${st.tun_active ? "TUN 虚拟网卡" : "系统代理"} 连接 ${node.name}`);
@@ -553,12 +590,17 @@ export default function App() {
         setProbeResult(null);
         setProbeError(null);
       }
+    } finally {
+      proxyBusyRef.current = false;
     }
   };
 
   const handleStopProxy = async () => {
+    userStopRef.current = true;
+    proxyBusyRef.current = true;
     try {
       const st = await api.stopProxy();
+      wasRunningRef.current = st.running;
       setStatus(st);
       setTelemetry({
         connected: false,
@@ -575,6 +617,8 @@ export default function App() {
       showToast("info", "已断开连接并恢复网络设置");
     } catch (err) {
       showToast("err", String(err));
+    } finally {
+      proxyBusyRef.current = false;
     }
   };
 
@@ -583,9 +627,12 @@ export default function App() {
       showToast("ok", "（预览模式）已模拟强制关闭 Windows 系统代理并刷新 WinINet");
       return;
     }
+    userStopRef.current = true;
+    proxyBusyRef.current = true;
     try {
       const msg = await api.resetSystemProxy();
       const st = await api.getRuntimeStatus();
+      wasRunningRef.current = st.running;
       setStatus(st);
       setTelemetry({
         connected: false,
@@ -602,6 +649,8 @@ export default function App() {
       showToast("ok", msg);
     } catch (err) {
       showToast("err", String(err));
+    } finally {
+      proxyBusyRef.current = false;
     }
   };
 

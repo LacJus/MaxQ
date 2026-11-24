@@ -280,3 +280,10 @@ proxies:
         .iter()
         .any(|f| f.category == "stripped_external_overrides" && f.count == 3));
 }
+
+#[test]
+fn rejects_oversized_import_payloads() {
+    let huge = "a".repeat(maxq_parser::MAX_IMPORT_BYTES + 16);
+    let err = parse_input(&huge).unwrap_err();
+    assert!(matches!(err, maxq_parser::ParseError::InputTooLarge { .. }));
+}

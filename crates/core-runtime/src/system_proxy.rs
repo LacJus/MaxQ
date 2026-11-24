@@ -302,6 +302,64 @@ impl Drop for SystemProxyManager {
     }
 }
 
+fn is_safe_wininet_bypass_entry(raw: &str) -> bool {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    if s.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, ';' | ',' | '\'' | '"' | '\\' | '/' | '=' | '?' | '#' | '@')
+    }) {
+        return false;
+    }
+    if s.eq_ignore_ascii_case("<local>") || s.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if s.contains('*') {
+        // Allow private IPv4 prefix globs (`127.*`, `10.*`, `192.168.*`, `169.254.*`, `172.16.*`..`172.31.*`, `100.64.*`)
+        if let Some(prefix) = s.strip_suffix(".*") {
+            if !prefix.contains('*') {
+                if matches!(prefix, "127" | "10" | "192.168" | "169.254" | "100.64") {
+                    return true;
+                }
+                if let Some(second) = prefix.strip_prefix("172.") {
+                    if second.parse::<u8>().is_ok_and(|n| (16..=31).contains(&n)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Allow leading `*.` ONLY for local domains or multi-label domain suffixes (blocks `*`, `*.*`, `*.com`, `*foo*`)
+        if let Some(suffix) = s.strip_prefix("*.") {
+            if suffix.contains('*') || suffix.is_empty() || suffix.starts_with('.') || suffix.ends_with('.') {
+                return false;
+            }
+            let lower = suffix.to_ascii_lowercase();
+            let valid_chars = lower
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if !valid_chars {
+                return false;
+            }
+            if matches!(lower.as_str(), "local" | "lan" | "internal" | "localhost") {
+                return true;
+            }
+            // Must have at least 2 non-empty labels (e.g. `*.apple.com`, never `*.com`)
+            let labels: Vec<&str> = lower.split('.').collect();
+            return labels.len() >= 2 && labels.iter().all(|l| !l.is_empty());
+        }
+        return false;
+    }
+
+    if let Ok(ip) = s.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        return !ip.is_unspecified();
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 pub fn build_windows_bypass_string(extra_bypass: &[String]) -> String {
     let mut entries: Vec<String> = vec![
         "localhost".into(),
@@ -309,13 +367,23 @@ pub fn build_windows_bypass_string(extra_bypass: &[String]) -> String {
         "10.*".into(),
         "172.16.*".into(),
         "192.168.*".into(),
+        "169.254.*".into(),
         "<local>".into(),
     ];
+    let mut total_len: usize = entries.iter().map(|s| s.len() + 1).sum();
     for item in extra_bypass {
         let cleaned = item.trim();
-        if !cleaned.is_empty() && !entries.iter().any(|e| e.eq_ignore_ascii_case(cleaned)) {
-            entries.push(cleaned.to_string());
+        if !is_safe_wininet_bypass_entry(cleaned) {
+            continue;
         }
+        if entries.iter().any(|e| e.eq_ignore_ascii_case(cleaned)) {
+            continue;
+        }
+        if entries.len() >= 64 || total_len + cleaned.len() + 1 > 2048 {
+            break;
+        }
+        total_len += cleaned.len() + 1;
+        entries.push(cleaned.to_string());
     }
     entries.join(";")
 }
@@ -844,5 +912,33 @@ mod tests {
 
         mgr.disable_and_restore().unwrap();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn bypass_string_blocks_wildcard_and_injection_attacks() {
+        let bypass = build_windows_bypass_string(&[
+            "*".into(),
+            "*.*".into(),
+            "*.com".into(),
+            "*.org".into(),
+            "0.0.0.0/0".into(),
+            "192.168.0.0/16".into(),
+            "evil.com;*.net".into(),
+            "bad\r\nhost".into(),
+            "*.local".into(),
+            "*.apple.com".into(),
+            "172.20.*".into(),
+        ]);
+        let parts: Vec<&str> = bypass.split(';').collect();
+        assert!(!parts.contains(&"*"));
+        assert!(!parts.contains(&"*.*"));
+        assert!(!parts.contains(&"*.com"));
+        assert!(!parts.contains(&"*.org"));
+        assert!(!parts.contains(&"0.0.0.0/0"));
+        assert!(!parts.contains(&"*.net"));
+        assert!(parts.contains(&"*.local"));
+        assert!(parts.contains(&"*.apple.com"));
+        assert!(parts.contains(&"172.20.*"));
+        assert!(parts.contains(&"169.254.*"));
     }
 }

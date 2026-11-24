@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,12 +14,14 @@ use maxq_core_model::{
 };
 use maxq_core_runtime::system_proxy::SystemProxyManager;
 use maxq_core_runtime::tun_client::TunServiceClient;
-use maxq_core_runtime::{RuntimeStatus, SingBoxSupervisor};
+use maxq_core_runtime::{RuntimeStatus, SingBoxSupervisor, SingleInstanceGuard};
 use maxq_parser::parse_input;
 use maxq_sanitizer::{
     apply_approved_host_aliases, is_non_public_ip, sanitize_import, validate_safe_remote_url,
 };
-use maxq_singbox_compiler::{builtin_default_rules_count, compile_singbox_v14, CompileInput};
+use maxq_singbox_compiler::{
+    builtin_default_rules_count, compile_singbox_v14, validate_runtime_policy, CompileInput,
+};
 use maxq_storage::{ProfileSummary, StoredProfile, VaultStore};
 use maxq_win_service::protocol::{TunServiceStatus, SERVICE_PROTOCOL_VERSION};
 use serde::Serialize;
@@ -44,6 +47,11 @@ pub struct AppState {
     pub service_exe_path: Option<PathBuf>,
     pub tun_active_node: Mutex<Option<(String, String)>>,
     pub clash_api_session: Mutex<Option<ActiveClashApiSession>>,
+    /// Serializes start/stop/reset/delete lifecycle transitions so concurrent clicks or shutdown
+    /// can NEVER interleave and re-enable system proxy after disconnect/exit.
+    pub lifecycle_lock: AsyncMutex<()>,
+    pub shutdown_requested: AtomicBool,
+    pub lifecycle_epoch: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,10 +216,16 @@ async fn fetch_subscription_url(url: String) -> Result<String, String> {
             }
         }
 
-        // 3. Pin verified SocketAddr into reqwest client and disable auto-redirects (H-2)
+        // 3. Pin verified SocketAddr into reqwest client, bypass OS proxy (prevents proxy-mediated
+        //    SSRF bypass or broken-sysproxy deadlock), and disable auto-redirects (H-2)
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
-            .user_agent("MaxQ/0.2 (Shadowrocket compatible)")
+            .user_agent(concat!(
+                "MaxQ/",
+                env!("CARGO_PKG_VERSION"),
+                " (Shadowrocket compatible)"
+            ))
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, addrs[0])
             .build()
@@ -308,7 +322,52 @@ fn get_profile(state: State<'_, AppState>, profile_id: String) -> Result<StoredP
 }
 
 #[tauri::command]
-fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
+async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
+    let _lifecycle = state.lifecycle_lock.lock().await;
+
+    let active_node_ids: HashSet<String> = {
+        let mut ids = HashSet::new();
+        if let Ok(guard) = state.tun_active_node.lock() {
+            if let Some((nid, _)) = guard.as_ref() {
+                ids.insert(nid.clone());
+            }
+        }
+        let sup = state.supervisor.lock().await;
+        let st = sup.status();
+        if st.running {
+            if let Some(nid) = st.active_node_id {
+                ids.insert(nid);
+            }
+        }
+        ids
+    };
+
+    let affects_active = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .get_profile(&profile_id)
+            .map(|p| p.nodes.iter().any(|n| active_node_ids.contains(&n.id)))
+            .unwrap_or(false)
+    };
+
+    if affects_active {
+        state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut sp) = state.sysproxy.lock() {
+            if sp.disable_and_restore().is_err() {
+                let _ = sp.force_disable();
+            }
+        }
+        let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+        if let Ok(mut guard) = state.tun_active_node.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = state.clash_api_session.lock() {
+            *guard = None;
+        }
+        let mut sup = state.supervisor.lock().await;
+        let _ = sup.stop().await;
+    }
+
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store.delete_profile(&profile_id).map_err(|e| e.to_string())
 }
@@ -400,12 +459,34 @@ fn update_profile_hosts(
 ) -> Result<StoredProfile, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     let mut profile = store.get_profile(&profile_id).map_err(|e| e.to_string())?;
+
+    // Defense-in-depth: ONLY allow toggling `approved` on pre-existing quarantined host entries;
+    // never let an IPC payload inject new entries or alter server-side host classification.
+    let approval_map: HashMap<(String, String), bool> = hosts
+        .into_iter()
+        .map(|h| {
+            (
+                (h.domain.trim().to_ascii_lowercase(), h.target.trim().to_string()),
+                h.approved,
+            )
+        })
+        .collect();
+    for existing in &mut profile.hosts {
+        let key = (
+            existing.domain.trim().to_ascii_lowercase(),
+            existing.target.trim().to_string(),
+        );
+        if let Some(&approved) = approval_map.get(&key) {
+            existing.approved = approved;
+        }
+    }
+
     for n in &mut profile.nodes {
         n.dial_override_server = None;
     }
-    apply_approved_host_aliases(&mut profile.nodes, &hosts);
+    apply_approved_host_aliases(&mut profile.nodes, &profile.hosts);
     store
-        .update_profile_hosts(&profile_id, &hosts, &profile.nodes)
+        .update_profile_hosts(&profile_id, &profile.hosts, &profile.nodes)
         .map_err(|e| e.to_string())?;
     store.get_profile(&profile_id).map_err(|e| e.to_string())
 }
@@ -624,6 +705,12 @@ async fn start_proxy(
     node_id: String,
     enable_system_proxy: bool,
 ) -> Result<RuntimeStatus, String> {
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        return Err("应用正在退出，已取消连接".into());
+    }
+    let my_epoch = state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
     let (profile, node, mut policy) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let profile = store.get_profile(&profile_id).map_err(|e| e.to_string())?;
@@ -660,12 +747,24 @@ async fn start_proxy(
         *guard = None;
     }
 
+    if state.shutdown_requested.load(Ordering::Acquire)
+        || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
+    {
+        return Err("连接已被新的断开或退出操作取消".into());
+    }
+
     if use_tun {
         let cfg_json = serde_json::to_string(&compiled.json).map_err(|e| e.to_string())?;
         let pid = tokio::task::spawn_blocking(move || TunServiceClient::start_tun(cfg_json))
             .await
             .map_err(|e| format!("TUN 启动任务异常: {e}"))?
             .map_err(|e| e.to_string())?;
+        if state.shutdown_requested.load(Ordering::Acquire)
+            || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
+        {
+            let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+            return Err("连接已被新的断开或退出操作取消".into());
+        }
         if let Ok(mut guard) = state.tun_active_node.lock() {
             *guard = Some((node.id.clone(), node.name.clone()));
         }
@@ -707,6 +806,14 @@ async fn start_proxy(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Re-check shutdown / epoch cancellation strictly BEFORE enabling Windows System Proxy!
+    if state.shutdown_requested.load(Ordering::Acquire)
+        || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
+    {
+        let _ = sup.stop().await;
+        return Err("连接已被新的断开或退出操作取消".into());
+    }
+
     if let Ok(mut guard) = state.clash_api_session.lock() {
         *guard = Some(ActiveClashApiSession {
             port: policy.clash_api_port,
@@ -738,6 +845,9 @@ async fn start_proxy(
 
 #[tauri::command]
 async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+    state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+    let _lifecycle = state.lifecycle_lock.lock().await;
+
     let sysproxy_err: Option<String> = {
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
         match sp.disable_and_restore() {
@@ -771,6 +881,9 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
 /// across LAN and PPPoE/RAS entries, then broadcasts WinINet refresh.
 #[tauri::command]
 async fn reset_system_proxy(state: State<'_, AppState>) -> Result<String, String> {
+    state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+    let _lifecycle = state.lifecycle_lock.lock().await;
+
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
@@ -968,12 +1081,17 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
             .and_then(|g| g.clone())
             .map(|(a, b)| (Some(a), Some(b)))
             .unwrap_or((None, None));
+        let clash_port = state
+            .clash_api_session
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.port));
         return Ok(RuntimeStatus {
             running: true,
             pid: tun_st.singbox_pid,
             active_node_id: nid,
             active_node_name: nname,
-            clash_api_port: None,
+            clash_api_port: clash_port,
             mixed_port: None,
             system_proxy_enabled: false,
             tun_active: true,
@@ -981,7 +1099,23 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
         });
     }
 
-    let sup = state.supervisor.lock().await;
+    let mut sup = state.supervisor.lock().await;
+    let was_running = sup.status().running;
+    let alive = sup.poll_alive();
+
+    // Auto-heal: if sing-box.exe died unexpectedly (crash / antivirus kill / OOM),
+    // immediately turn OFF Windows System Proxy so the user's browser is NEVER stranded!
+    if was_running && !alive {
+        if let Ok(mut sp) = state.sysproxy.lock() {
+            if sp.disable_and_restore().is_err() {
+                let _ = sp.force_disable();
+            }
+        }
+        if let Ok(mut guard) = state.clash_api_session.lock() {
+            *guard = None;
+        }
+    }
+
     let mut status = sup.status();
     let sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
     status.system_proxy_enabled = sp.is_active();
@@ -1020,6 +1154,7 @@ fn update_runtime_policy(
     state: State<'_, AppState>,
     policy: RuntimePolicy,
 ) -> Result<RuntimePolicy, String> {
+    validate_runtime_policy(&policy)?;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .save_runtime_policy(&policy)
@@ -1043,8 +1178,14 @@ fn resolve_bundled_binary(app: &tauri::App, bin_name: &str) -> Option<PathBuf> {
 
 /// Unified, idempotent runtime teardown executed on tray quit, window close/destroy,
 /// and Tauri `RunEvent::ExitRequested` / `RunEvent::Exit` (including OS logoff/shutdown).
-fn cleanup_all_runtime(app_handle: &tauri::AppHandle) {
+fn cleanup_all_runtime(app_handle: &tauri::AppHandle, is_shutdown: bool) {
     let state = app_handle.state::<AppState>();
+
+    // Cancel any in-flight `start_proxy` FIRST so it can never re-enable system proxy after cleanup
+    if is_shutdown {
+        state.shutdown_requested.store(true, Ordering::Release);
+    }
+    state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
 
     if let Ok(mut sp) = state.sysproxy.lock() {
         if sp.disable_and_restore().is_err() {
@@ -1073,6 +1214,14 @@ fn cleanup_all_runtime(app_handle: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enforce single desktop instance BEFORE touching `sysproxy-backup.json` or SQLite vault!
+    let _single_instance = match SingleInstanceGuard::acquire_or_focus_existing(
+        "MaxQ — Powered by JaxCore sing-box",
+    ) {
+        Some(guard) => guard,
+        None => return,
+    };
+
     tauri::Builder::default()
         .setup(|app| {
             let data_dir = app
@@ -1085,6 +1234,8 @@ pub fn run() {
             let store = VaultStore::open(&db_path).expect("failed to open MaxQ SQLite vault");
 
             let runtime_dir = data_dir.join("runtime");
+            // Remove any stale plaintext runtime config left behind by a sudden power loss
+            let _ = std::fs::remove_file(runtime_dir.join("active-config.json"));
             let mut sysproxy = SystemProxyManager::new(&runtime_dir);
             if sysproxy.recover_if_dirty().is_err() {
                 let _ = sysproxy.force_disable();
@@ -1107,6 +1258,9 @@ pub fn run() {
                 service_exe_path,
                 tun_active_node: Mutex::new(None),
                 clash_api_session: Mutex::new(None),
+                lifecycle_lock: AsyncMutex::new(()),
+                shutdown_requested: AtomicBool::new(false),
+                lifecycle_epoch: AtomicU64::new(0),
             });
 
             // Build system tray for quick show/hide, emergency proxy reset, and clean quit
@@ -1133,14 +1287,14 @@ pub fn run() {
                         }
                     }
                     "reset_proxy" => {
-                        cleanup_all_runtime(app_handle);
+                        cleanup_all_runtime(app_handle, false);
                         let state = app_handle.state::<AppState>();
                         if let Ok(mut sp) = state.sysproxy.lock() {
                             let _ = sp.force_disable();
                         }
                     }
                     "quit" => {
-                        cleanup_all_runtime(app_handle);
+                        cleanup_all_runtime(app_handle, true);
                         app_handle.exit(0);
                     }
                     _ => {}
@@ -1170,7 +1324,7 @@ pub fn run() {
                 event,
                 tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
             ) {
-                cleanup_all_runtime(window.app_handle());
+                cleanup_all_runtime(window.app_handle(), true);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1211,7 +1365,7 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                cleanup_all_runtime(app_handle);
+                cleanup_all_runtime(app_handle, true);
             }
         });
 }

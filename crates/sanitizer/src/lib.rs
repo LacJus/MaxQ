@@ -168,6 +168,38 @@ pub fn sanitize_import(raw: RawImportBundle) -> SanitizedImport {
         }
     }
 
+    // 2b. Sanitize `skip-proxy` entries to block total proxy-bypass wildcards (`*`, `*.com`, public CIDRs)
+    //     and Windows Registry/WinINet ProxyOverride injection (`;`, control chars).
+    if !general.skip_proxy.is_empty() {
+        let mut safe_skip = Vec::new();
+        let mut stripped_skip = Vec::new();
+        for entry in general.skip_proxy.drain(..) {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_safe_skip_proxy_entry(trimmed) && safe_skip.len() < 128 {
+                safe_skip.push(trimmed.to_string());
+            } else {
+                stripped_skip.push(trimmed.chars().take(64).collect::<String>());
+            }
+        }
+        general.skip_proxy = safe_skip;
+        if !stripped_skip.is_empty() {
+            report.findings.push(SecurityFinding {
+                severity: SecuritySeverity::High,
+                action: SecurityActionTaken::Stripped,
+                category: "stripped_unsafe_skip_proxy".to_string(),
+                summary: format!(
+                    "Stripped {} unsafe or overly broad skip-proxy entry(s) (e.g. `*`, TLD wildcards, public CIDRs, or control characters) to prevent silent system-proxy bypass.",
+                    stripped_skip.len()
+                ),
+                samples: stripped_skip.iter().take(5).cloned().collect(),
+                count: stripped_skip.len(),
+            });
+        }
+    }
+
     // 3. Record hard-stripped dangerous .conf sections ([MITM], [Script], [URL Rewrite], etc.).
     for sec in &raw.dangerous_sections {
         report.stripped_sections.push(sec.section_name.clone());
@@ -474,6 +506,70 @@ pub fn is_strictly_private_cidr(cidr: &str) -> bool {
     }
 }
 
+/// Returns true ONLY if a `skip-proxy` entry is safe to pass into OS proxy bypass settings:
+/// blocks `*`, `*.*`, TLD wildcards (`*.com`), public CIDRs (`0.0.0.0/0`), and injection chars (`;`, control chars).
+pub fn is_safe_skip_proxy_entry(raw: &str) -> bool {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    if s.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, ';' | ',' | '\'' | '"' | '\\' | '=' | '?' | '#' | '@')
+    }) {
+        return false;
+    }
+    if s.contains('/') {
+        return is_strictly_private_cidr(s);
+    }
+    if s.eq_ignore_ascii_case("<local>") || s.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if s.contains('*') {
+        if let Some(prefix) = s.strip_suffix(".*") {
+            if !prefix.contains('*') {
+                if matches!(prefix, "127" | "10" | "192.168" | "169.254" | "100.64") {
+                    return true;
+                }
+                if let Some(second) = prefix.strip_prefix("172.") {
+                    if second.parse::<u8>().is_ok_and(|n| (16..=31).contains(&n)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(suffix) = s.strip_prefix("*.") {
+            if suffix.contains('*')
+                || suffix.is_empty()
+                || suffix.starts_with('.')
+                || suffix.ends_with('.')
+            {
+                return false;
+            }
+            let lower = suffix.to_ascii_lowercase();
+            if !lower
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return false;
+            }
+            if matches!(lower.as_str(), "local" | "lan" | "internal" | "localhost") {
+                return true;
+            }
+            let labels: Vec<&str> = lower.split('.').collect();
+            return labels.len() >= 2 && labels.iter().all(|l| !l.is_empty());
+        }
+        return false;
+    }
+
+    if let Ok(ip) = s.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        return !ip.is_unspecified();
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 fn is_local_domain(domain_lower: &str) -> bool {
     // Strip trailing DNS root dots to prevent `localhost.` / `foo.local.` bypass (H-1)
     let clean = domain_lower.trim_end_matches('.');
@@ -699,5 +795,35 @@ mod tests {
             sanitized.nodes[0].dial_override_server.as_deref(),
             Some("edge-sh.example-cdn.net")
         );
+    }
+
+    #[test]
+    fn strips_malicious_skip_proxy_wildcards_and_injections() {
+        let raw = RawImportBundle {
+            format_detected: ImportFormat::ShadowrocketConf,
+            general: maxq_core_model::GeneralSettings {
+                skip_proxy: vec![
+                    "*".into(),
+                    "*.com".into(),
+                    "0.0.0.0/0".into(),
+                    "evil.com;*.net".into(),
+                    "*.local".into(),
+                    "192.168.0.0/16".into(),
+                    "*.apple.com".into(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sanitized = sanitize_import(raw);
+        assert_eq!(
+            sanitized.general.skip_proxy,
+            vec!["*.local", "192.168.0.0/16", "*.apple.com"]
+        );
+        assert!(sanitized
+            .report
+            .findings
+            .iter()
+            .any(|f| f.category == "stripped_unsafe_skip_proxy" && f.count == 4));
     }
 }

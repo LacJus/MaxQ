@@ -45,10 +45,124 @@ pub enum CompileError {
     ConflictingPinAndReality { node_name: String },
     #[error("Node '{node_name}' uses a mandatory-TLS protocol (Trojan/AnyTLS/Hysteria2/TUIC) but tls.enabled is false.")]
     MandatoryTlsDisabled { node_name: String },
+    #[error("Node '{node_name}' has an invalid endpoint: {reason}")]
+    InvalidNodeEndpoint { node_name: String, reason: String },
+    #[error("Invalid local port policy: {reason}")]
+    InvalidPortConfig { reason: String },
+    #[error("Invalid DNS server for {field} ('{value}'): {reason}")]
+    InvalidDnsServer {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
     #[error("Invalid Clash API secret: must be at least 32 characters with no whitespace or control characters.")]
     WeakClashApiSecret,
     #[error("Invalid CORS origins: access_control_allow_origin must contain only strict http(s)://host[:port] origins.")]
     UnsafeCorsOrigins,
+}
+
+/// Validates and normalizes `RuntimePolicy` ports & DNS settings before persistence or compilation.
+pub fn validate_runtime_policy(policy: &RuntimePolicy) -> Result<(), String> {
+    if policy.mixed_listen_port < 1024 {
+        return Err(format!(
+            "Mixed 代理端口 {} 无效，请使用 1024–65535 之间的端口",
+            policy.mixed_listen_port
+        ));
+    }
+    if policy.clash_api_port < 1024 {
+        return Err(format!(
+            "Clash API 端口 {} 无效，请使用 1024–65535 之间的端口",
+            policy.clash_api_port
+        ));
+    }
+    if policy.mixed_listen_port == policy.clash_api_port {
+        return Err(format!(
+            "Mixed 代理端口与 Clash API 端口不能同为 {}",
+            policy.mixed_listen_port
+        ));
+    }
+    parse_remote_doh_server(&policy.remote_dns_server)
+        .map_err(|r| format!("远端 DoH DNS 无效（{}）：{r}", policy.remote_dns_server))?;
+    parse_direct_udp_dns_server(&policy.direct_dns_server)
+        .map_err(|r| format!("直连 / Bootstrap DNS 无效（{}）：{r}", policy.direct_dns_server))?;
+    Ok(())
+}
+
+/// Parses a remote DoH server setting: accepts bare IP (`1.1.1.1`), bare hostname (`dns.google`),
+/// or full HTTPS URL (`https://dns.google/dns-query`), returning `(server, optional_port, optional_path)`.
+pub fn parse_remote_doh_server(raw: &str) -> Result<(String, Option<u16>, Option<String>), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return Err("不能为空或超过 256 字符".into());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("不能包含空白或控制字符".into());
+    }
+
+    let (host, port, path) = if trimmed.contains("://") {
+        let url = Url::parse(trimmed).map_err(|e| format!("URL 格式无效: {e}"))?;
+        if url.scheme() != "https" {
+            return Err("远端 DoH URL 必须使用 https:// 协议".into());
+        }
+        let h = url
+            .host_str()
+            .ok_or_else(|| "缺少主机名".to_string())?
+            .trim_matches(|c| c == '[' || c == ']')
+            .to_string();
+        let p = url.port();
+        let path_opt = match url.path() {
+            "" | "/" => None,
+            p_str => Some(p_str.to_string()),
+        };
+        (h, p, path_opt)
+    } else {
+        let stripped = trimmed.trim_matches(|c| c == '[' || c == ']');
+        if stripped.parse::<IpAddr>().is_ok() {
+            (stripped.to_string(), None, None)
+        } else if stripped
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            && !stripped.starts_with('.')
+            && !stripped.ends_with('.')
+        {
+            (stripped.to_string(), None, None)
+        } else {
+            return Err("应为有效 IP、域名或 https:// DoH 地址".into());
+        }
+    };
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err("远端 DoH 不能指向本机回环地址".into());
+        }
+    }
+    Ok((host, port, path))
+}
+
+/// Parses a direct/bootstrap UDP DNS server setting (must be an IPv4/IPv6 literal, with optional `udp://` or `:port`).
+pub fn parse_direct_udp_dns_server(raw: &str) -> Result<(String, Option<u16>), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err("不能为空".into());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("不能包含空白或控制字符".into());
+    }
+    let body = trimmed.strip_prefix("udp://").unwrap_or(trimmed);
+
+    if let Ok(ip) = body.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return Err("不能为 0.0.0.0 或 ::".into());
+        }
+        return Ok((ip.to_string(), None));
+    }
+    if let Ok(sock) = body.parse::<std::net::SocketAddr>() {
+        if sock.ip().is_unspecified() || sock.port() == 0 {
+            return Err("地址或端口无效".into());
+        }
+        return Ok((sock.ip().to_string(), Some(sock.port())));
+    }
+    Err("直连 Bootstrap DNS 必须为纯 IP 地址（例如 223.5.5.5 或 119.29.29.29）".into())
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +187,35 @@ pub struct CompiledConfig {
 /// with zero deprecated fields, Scheme A TLS enforcement, direct-node DNS/IPv6 anti-leak,
 /// category-safe order-preserving rule coalescing, and hardened local Clash API settings.
 pub fn compile_singbox_v14(input: &CompileInput<'_>) -> Result<CompiledConfig, CompileError> {
+    // 0. Validate local listener ports & DNS servers up front
+    if input.policy.mixed_listen_port < 1024 || input.policy.clash_api_port < 1024 {
+        return Err(CompileError::InvalidPortConfig {
+            reason: "mixed_listen_port and clash_api_port must be >= 1024".into(),
+        });
+    }
+    if input.policy.mixed_listen_port == input.policy.clash_api_port {
+        return Err(CompileError::InvalidPortConfig {
+            reason: format!(
+                "mixed_listen_port and clash_api_port cannot both be {}",
+                input.policy.mixed_listen_port
+            ),
+        });
+    }
+    let remote_doh = parse_remote_doh_server(&input.policy.remote_dns_server).map_err(|reason| {
+        CompileError::InvalidDnsServer {
+            field: "remote_dns_server",
+            value: input.policy.remote_dns_server.clone(),
+            reason,
+        }
+    })?;
+    let direct_udp = parse_direct_udp_dns_server(&input.policy.direct_dns_server).map_err(|reason| {
+        CompileError::InvalidDnsServer {
+            field: "direct_dns_server",
+            value: input.policy.direct_dns_server.clone(),
+            reason,
+        }
+    })?;
+
     // 1. Validate & prepare hardened Clash API secret (>= 32 chars) & strict CORS origins (M-3)
     let clash_api_secret = if input.policy.clash_api_secret.is_empty() {
         generate_random_secret_hex()
@@ -107,13 +250,13 @@ pub fn compile_singbox_v14(input: &CompileInput<'_>) -> Result<CompiledConfig, C
         RoutingMode::Global | RoutingMode::Direct => (&[], false),
     };
 
-    // 2. Compile active proxy outbound (enforces Scheme A TLS gate + mandatory TLS!)
+    // 2. Compile active proxy outbound (enforces Scheme A TLS gate + mandatory TLS + valid endpoint!)
     let proxy_outbound = compile_node_outbound(input.active_node, "proxy")?;
 
     // 3. Compile DNS section (v1.12+ typed servers, explicit proxy detour, order-preserving rules)
-    let dns_value = build_dns_section(input, effective_rules);
+    let dns_value = build_dns_section(input, effective_rules, &remote_doh, &direct_udp);
 
-    // 4. Compile inbounds (strictly 127.0.0.1 unless allow_lan, private-CIDR-only TUN exclusions)
+    // 4. Compile inbounds (strictly 127.0.0.1 in TUN mode or when !allow_lan; private-CIDR-only TUN exclusions)
     let inbounds = build_inbounds(input);
 
     // 5. Compile route section (v1.11+ rule actions + category-safe order-preserving coalescing)
@@ -187,7 +330,9 @@ fn is_valid_cors_origin(raw: &str) -> bool {
 }
 
 fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
-    let listen_addr = if input.policy.allow_lan {
+    let enable_tun = input.policy.tun_enabled || input.policy.proxy_mode == ProxyMode::Tun;
+    // Privileged TUN service strictly enforces mixed-in on 127.0.0.1 regardless of allow_lan
+    let listen_addr = if input.policy.allow_lan && !enable_tun {
         "0.0.0.0"
     } else {
         "127.0.0.1"
@@ -199,7 +344,6 @@ fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
         "listen_port": input.policy.mixed_listen_port
     })];
 
-    let enable_tun = input.policy.tun_enabled || input.policy.proxy_mode == ProxyMode::Tun;
     if enable_tun {
         let mut excluded: Vec<String> = vec![
             "127.0.0.0/8".into(),
@@ -287,21 +431,38 @@ impl DnsDomainBucket {
     }
 }
 
-fn build_dns_section(input: &CompileInput<'_>, effective_rules: &[RuleEntry]) -> Value {
-    let mut servers = vec![
-        // CRITICAL (sing-box v1.12+): typed DoH defaults to DIRECT unless detour is explicit!
-        json!({
-            "type": "https",
-            "tag": "dns-remote",
-            "server": input.policy.remote_dns_server,
-            "detour": "proxy"
-        }),
-        json!({
-            "type": "udp",
-            "tag": "dns-direct",
-            "server": input.policy.direct_dns_server
-        }),
-    ];
+fn build_dns_section(
+    input: &CompileInput<'_>,
+    effective_rules: &[RuleEntry],
+    remote_doh: &(String, Option<u16>, Option<String>),
+    direct_udp: &(String, Option<u16>),
+) -> Value {
+    // CRITICAL (sing-box v1.12+): typed DoH defaults to DIRECT unless detour is explicit!
+    let mut remote_srv = Map::new();
+    remote_srv.insert("type".into(), json!("https"));
+    remote_srv.insert("tag".into(), json!("dns-remote"));
+    remote_srv.insert("server".into(), json!(remote_doh.0));
+    if let Some(port) = remote_doh.1 {
+        remote_srv.insert("server_port".into(), json!(port));
+    }
+    if let Some(ref path) = remote_doh.2 {
+        remote_srv.insert("path".into(), json!(path));
+    }
+    // If remote DoH server is a domain name (e.g. `dns.google`), sing-box v1.14 requires `domain_resolver`
+    if remote_doh.0.parse::<IpAddr>().is_err() {
+        remote_srv.insert("domain_resolver".into(), json!("dns-direct"));
+    }
+    remote_srv.insert("detour".into(), json!("proxy"));
+
+    let mut direct_srv = Map::new();
+    direct_srv.insert("type".into(), json!("udp"));
+    direct_srv.insert("tag".into(), json!("dns-direct"));
+    direct_srv.insert("server".into(), json!(direct_udp.0));
+    if let Some(port) = direct_udp.1 {
+        direct_srv.insert("server_port".into(), json!(port));
+    }
+
+    let mut servers = vec![Value::Object(remote_srv), Value::Object(direct_srv)];
 
     // Add ONLY explicitly approved non-ProxyEndpointAlias exact-domain IP hosts into global dns-hosts (H-5)
     let mut predefined: BTreeMap<String, Value> = BTreeMap::new();
@@ -666,10 +827,27 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             node_name: node.name.clone(),
         });
     }
+    let dial_server = node.effective_dial_server().trim();
+    if dial_server.is_empty()
+        || dial_server
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(CompileError::InvalidNodeEndpoint {
+            node_name: node.name.clone(),
+            reason: "server host is empty or contains whitespace/control characters".into(),
+        });
+    }
+    if node.server_port == 0 {
+        return Err(CompileError::InvalidNodeEndpoint {
+            node_name: node.name.clone(),
+            reason: "server_port cannot be 0".into(),
+        });
+    }
 
     let mut obj = Map::new();
     obj.insert("tag".into(), json!(tag));
-    obj.insert("server".into(), json!(node.effective_dial_server()));
+    obj.insert("server".into(), json!(dial_server));
     obj.insert("server_port".into(), json!(node.server_port));
 
     match &node.protocol {

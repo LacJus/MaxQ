@@ -294,9 +294,27 @@ pub async fn probe_tcp_latency_ms(host: &str, port: u16, timeout_ms: u64) -> Res
     Ok(started.elapsed().as_millis().max(1) as u64)
 }
 
+const MAX_LEAF_CERT_DER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Default)]
+struct CapturedLeaf {
+    leaf_der: Option<Vec<u8>>,
+    chain_len: usize,
+}
+
 async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate, ProbeError> {
+    if req.host.trim().is_empty() || req.port == 0 {
+        return Err(ProbeError::InvalidServerName(format!(
+            "{}:{}",
+            req.host, req.port
+        )));
+    }
+    if req.sni.trim().is_empty() {
+        return Err(ProbeError::InvalidServerName(req.sni.clone()));
+    }
+
     let target_addr = resolve_target(&req.host, req.port).await?;
-    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured: Arc<Mutex<CapturedLeaf>> = Arc::new(Mutex::new(CapturedLeaf::default()));
     let sig_verified = Arc::new(AtomicBool::new(false));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
@@ -326,16 +344,16 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
                 .map_err(ProbeError::TcpConnect)?;
             let connector = TlsConnector::from(Arc::new(tls_config));
             let handshake_res = connector.connect(server_name, tcp).await;
-            let certs = captured
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if certs.is_empty() {
+            let (leaf_opt, chain_len) = {
+                let g = captured.lock().unwrap_or_else(|e| e.into_inner());
+                (g.leaf_der.clone(), g.chain_len)
+            };
+            let Some(leaf) = leaf_opt else {
                 if let Err(e) = handshake_res {
                     return Err(ProbeError::TlsHandshake(e.to_string()));
                 }
                 return Err(ProbeError::NoCertificatePresented);
-            }
+            };
             // Cryptographic proof-of-possession check: peer MUST have signed TLS CertificateVerify (H-4)
             if !sig_verified.load(Ordering::Acquire) {
                 return Err(match handshake_res {
@@ -343,7 +361,7 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
                     Ok(_) => ProbeError::SignatureNotVerified,
                 });
             }
-            parse_captured_certs(&certs, &req.sni)
+            parse_leaf_cert_der(&leaf, &req.sni, chain_len)
         }
         ProbeTransport::Quic {
             salamander_password,
@@ -384,23 +402,23 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
             let handshake_res = connecting.await;
             endpoint.close(0u32.into(), b"probe-done");
 
-            let certs = captured
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if certs.is_empty() {
+            let (leaf_opt, chain_len) = {
+                let g = captured.lock().unwrap_or_else(|e| e.into_inner());
+                (g.leaf_der.clone(), g.chain_len)
+            };
+            let Some(leaf) = leaf_opt else {
                 if let Err(e) = handshake_res {
                     return Err(ProbeError::QuicHandshake(e.to_string()));
                 }
                 return Err(ProbeError::NoCertificatePresented);
-            }
+            };
             if !sig_verified.load(Ordering::Acquire) {
                 return Err(match handshake_res {
                     Err(e) => ProbeError::QuicHandshake(e.to_string()),
                     Ok(_) => ProbeError::SignatureNotVerified,
                 });
             }
-            parse_captured_certs(&certs, &req.sni)
+            parse_leaf_cert_der(&leaf, &req.sni, chain_len)
         }
     }
 }
@@ -503,11 +521,6 @@ pub fn parse_leaf_cert_der(
     })
 }
 
-fn parse_captured_certs(certs: &[Vec<u8>], sni: &str) -> Result<ProbedCertificate, ProbeError> {
-    let leaf = certs.first().ok_or(ProbeError::NoCertificatePresented)?;
-    parse_leaf_cert_der(leaf, sni, certs.len())
-}
-
 fn check_sni_match(sni: &str, san_dns: &[String], san_ip: &[String]) -> bool {
     let target = sni.trim().trim_end_matches('.').to_ascii_lowercase();
     if target.is_empty() {
@@ -543,7 +556,7 @@ fn check_sni_match(sni: &str, san_dns: &[String], san_ip: &[String]) -> bool {
 /// cryptographic signatures so an attacker without the private key cannot spoof a certificate (H-4).
 #[derive(Debug)]
 struct CapturingCertVerifier {
-    captured: Arc<Mutex<Vec<Vec<u8>>>>,
+    captured: Arc<Mutex<CapturedLeaf>>,
     sig_verified: Arc<AtomicBool>,
     algs: WebPkiSupportedAlgorithms,
 }
@@ -557,12 +570,15 @@ impl ServerCertVerifier for CapturingCertVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        let mut guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clear();
-        guard.push(end_entity.as_ref().to_vec());
-        for cert in intermediates {
-            guard.push(cert.as_ref().to_vec());
+        let leaf_bytes = end_entity.as_ref();
+        if leaf_bytes.is_empty() || leaf_bytes.len() > MAX_LEAF_CERT_DER_BYTES {
+            return Err(RustlsError::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
         }
+        let mut guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+        guard.leaf_der = Some(leaf_bytes.to_vec());
+        guard.chain_len = 1 + intermediates.len();
         Ok(ServerCertVerified::assertion())
     }
 

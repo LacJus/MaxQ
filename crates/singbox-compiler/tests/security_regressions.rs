@@ -309,3 +309,84 @@ fn m3_and_m4_enforce_strong_secret_cors_and_final_reject() {
         .unwrap();
     assert_eq!(last_rule["action"], serde_json::json!("reject"));
 }
+
+#[test]
+fn validates_ports_endpoints_doh_urls_domain_resolver_and_tun_loopback() {
+    let mut node = NodeConfig::new(
+        "AnyTLS",
+        "edge.example.com",
+        443,
+        ProtocolConfig::AnyTls {
+            password: "pw".into(),
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
+        },
+    );
+    node.tls.enabled = true;
+
+    // 1. Colliding local ports rejected
+    let mut colliding = RuntimePolicy::default();
+    colliding.mixed_listen_port = 17890;
+    colliding.clash_api_port = 17890;
+    assert!(matches!(
+        compile_singbox_v14(&CompileInput {
+            active_node: &node,
+            rules: &[],
+            general: &GeneralSettings::default(),
+            approved_hosts: &[],
+            policy: &colliding,
+        }),
+        Err(CompileError::InvalidPortConfig { .. })
+    ));
+
+    // 2. Port 0 node rejected
+    let mut bad_node = node.clone();
+    bad_node.server_port = 0;
+    assert!(matches!(
+        compile_singbox_v14(&CompileInput {
+            active_node: &bad_node,
+            rules: &[],
+            general: &GeneralSettings::default(),
+            approved_hosts: &[],
+            policy: &RuntimePolicy::default(),
+        }),
+        Err(CompileError::InvalidNodeEndpoint { .. })
+    ));
+
+    // 3. Full https:// DoH URL with domain name automatically emits path + domain_resolver + detour=proxy
+    let mut doh_policy = RuntimePolicy::default();
+    doh_policy.remote_dns_server = "https://dns.google/dns-query".into();
+    doh_policy.allow_lan = true;
+    doh_policy.tun_enabled = true;
+    let compiled = compile_singbox_v14(&CompileInput {
+        active_node: &node,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &doh_policy,
+    })
+    .unwrap();
+    let remote_dns = &compiled.json["dns"]["servers"][0];
+    assert_eq!(remote_dns["server"], "dns.google");
+    assert_eq!(remote_dns["path"], "/dns-query");
+    assert_eq!(remote_dns["domain_resolver"], "dns-direct");
+    assert_eq!(remote_dns["detour"], "proxy");
+
+    // 4. TUN mode forces mixed-in strictly to 127.0.0.1 even when allow_lan = true
+    assert_eq!(compiled.json["inbounds"][0]["listen"], "127.0.0.1");
+
+    // 5. Non-IP direct bootstrap DNS rejected
+    let mut bad_dns = RuntimePolicy::default();
+    bad_dns.direct_dns_server = "dns.alidns.com".into();
+    assert!(matches!(
+        compile_singbox_v14(&CompileInput {
+            active_node: &node,
+            rules: &[],
+            general: &GeneralSettings::default(),
+            approved_hosts: &[],
+            policy: &bad_dns,
+        }),
+        Err(CompileError::InvalidDnsServer { .. })
+    ));
+}

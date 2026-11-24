@@ -109,6 +109,67 @@ pub fn detect_singbox_log_pin_mismatch(log_line: &str) -> Option<String> {
     }
 }
 
+/// Case-insensitive, all-occurrences redaction of Bearer tokens, passwords, secrets,
+/// and auth parameters before exposing runtime logs to the UI or diagnostics.
+pub fn redact_log_line(line: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "bearer ",
+        "secret=",
+        "\"secret\":",
+        "password=",
+        "\"password\":",
+        "token=",
+        "\"token\":",
+        "auth=",
+    ];
+
+    let mut out = line.to_string();
+    for &marker in MARKERS {
+        let mut cursor = 0usize;
+        while cursor < out.len() {
+            let lower_tail = out[cursor..].to_ascii_lowercase();
+            let Some(rel_pos) = lower_tail.find(marker) else {
+                break;
+            };
+            let mut val_start = cursor + rel_pos + marker.len();
+            // Skip optional spaces and opening quote for JSON-style `"secret": "value"`
+            let bytes = out.as_bytes();
+            while val_start < bytes.len() && bytes[val_start] == b' ' {
+                val_start += 1;
+            }
+            let quoted = val_start < bytes.len() && bytes[val_start] == b'"';
+            if quoted {
+                val_start += 1;
+            }
+            if val_start >= out.len() {
+                break;
+            }
+            let val_end = out[val_start..]
+                .find(|c: char| {
+                    if quoted {
+                        c == '"' || c == '\n' || c == '\r'
+                    } else {
+                        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == '&' || c == ';' || c == '}'
+                    }
+                })
+                .map(|i| val_start + i)
+                .unwrap_or(out.len());
+            if val_end > val_start && &out[val_start..val_end] != "<REDACTED>" {
+                out.replace_range(val_start..val_end, "<REDACTED>");
+                cursor = val_start + "<REDACTED>".len();
+            } else if val_end > val_start {
+                cursor = val_end;
+            } else {
+                cursor = out[val_start..]
+                    .chars()
+                    .next()
+                    .map_or(out.len(), |c| val_start + c.len_utf8());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +187,19 @@ mod tests {
         assert_eq!(PIPE_CLIENT_ACCESS_MASK & (GENERIC_READ | GENERIC_WRITE), 0);
         // Every requested client right MUST be granted by PIPE_IU_DACL_MASK (otherwise ERROR_ACCESS_DENIED!)
         assert_eq!(PIPE_CLIENT_ACCESS_MASK & !PIPE_IU_DACL_MASK, 0);
+    }
+
+    #[test]
+    fn redacts_multiple_and_case_variant_secrets_from_logs() {
+        let line = r#"Authorization: bearer tok12345 {"secret": "s3cr3tVal"} password=pw1&password=pw2 token=abc"#;
+        let redacted = redact_log_line(line);
+        assert!(!redacted.contains("tok12345"));
+        assert!(!redacted.contains("s3cr3tVal"));
+        assert!(!redacted.contains("pw1"));
+        assert!(!redacted.contains("pw2"));
+        assert!(!redacted.contains("abc"));
+        assert!(redacted.contains("bearer <REDACTED>"));
+        assert!(redacted.contains(r#""secret": "<REDACTED>""#));
+        assert!(redacted.contains("password=<REDACTED>&password=<REDACTED>"));
     }
 }

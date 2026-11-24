@@ -271,6 +271,8 @@ fn audit_json_keys_recursively(
 ) -> Result<(), String> {
     match val {
         Value::Object(map) => {
+            let is_https_doh_obj =
+                map.get("type").and_then(|t| t.as_str()) == Some("https") && map.get("server").is_some();
             for (k, v) in map {
                 if !inside_freeform_map {
                     if k.chars().any(|c| c.is_ascii_uppercase()) {
@@ -278,12 +280,17 @@ fn audit_json_keys_recursively(
                             "non-lowercase config key '{k}' rejected (anti-EqualFold bypass)"
                         ));
                     }
-                    // Allow HTTP URL path strictly inside `transport` (e.g. WebSocket `/ws`)
-                    let is_safe_transport_path = inside_transport
+                    // Allow HTTP URL path strictly inside `transport` (e.g. WebSocket `/ws`) or
+                    // an `https` DoH DNS server object (e.g. `/dns-query`), never filesystem paths
+                    let is_safe_http_url_path = (inside_transport || is_https_doh_obj)
                         && k == "path"
-                        && v.as_str()
-                            .is_some_and(|s| s.starts_with('/') && !s.contains('\\') && !s.contains(".."));
-                    if !is_safe_transport_path {
+                        && v.as_str().is_some_and(|s| {
+                            s.starts_with('/')
+                                && !s.contains('\\')
+                                && !s.contains("..")
+                                && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+                        });
+                    if !is_safe_http_url_path {
                         let lower = k.to_ascii_lowercase();
                         for bad in FORBIDDEN_KEY_SUBSTRINGS {
                             if lower.contains(bad) {

@@ -8,10 +8,17 @@ use base64::Engine;
 use maxq_core_model::{ImportFormat, RawImportBundle};
 use thiserror::Error;
 
+/// Hard upper bound on untrusted import text/decoded payloads (16 MiB) to block YAML/Base64 OOM bombs.
+pub const MAX_IMPORT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_NODES_PER_IMPORT: usize = 4096;
+pub const MAX_RULES_PER_IMPORT: usize = 100_000;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("empty input")]
     EmptyInput,
+    #[error("import input exceeds safety limit ({bytes} bytes > {max_bytes} bytes)")]
+    InputTooLarge { bytes: usize, max_bytes: usize },
     #[error("unsupported protocol or share link: {0}")]
     UnsupportedScheme(String),
     #[error("malformed share link ({scheme}): {reason}")]
@@ -30,42 +37,65 @@ pub enum ParseError {
 /// IMPORTANT: Always pass the returned `RawImportBundle` through `maxq_sanitizer::sanitize_import`
 /// before persisting or compiling.
 pub fn parse_input(raw: &str) -> Result<RawImportBundle, ParseError> {
+    if raw.len() > MAX_IMPORT_BYTES {
+        return Err(ParseError::InputTooLarge {
+            bytes: raw.len(),
+            max_bytes: MAX_IMPORT_BYTES,
+        });
+    }
     let trimmed = raw.trim_start_matches('\u{feff}').trim();
     if trimmed.is_empty() {
         return Err(ParseError::EmptyInput);
     }
 
-    // 1. sing-box JSON
-    if trimmed.starts_with('{') {
-        return singbox_json::parse_singbox_json(trimmed);
-    }
-
-    // 2. Shadowrocket / Surge INI `.conf`
-    if is_shadowrocket_conf(trimmed) {
-        return shadowrocket_conf::parse_shadowrocket_conf(trimmed);
-    }
-
-    // 3. Direct share links (one or multiple lines)
-    if contains_share_link_line(trimmed) {
-        return parse_share_link_lines(trimmed, ImportFormat::ShareLinks);
-    }
-
-    // 4. Clash YAML (contains `proxies:` top-level key)
-    if trimmed
+    let mut bundle = if trimmed.starts_with('{') {
+        // 1. sing-box JSON
+        singbox_json::parse_singbox_json(trimmed)?
+    } else if is_shadowrocket_conf(trimmed) {
+        // 2. Shadowrocket / Surge INI `.conf`
+        shadowrocket_conf::parse_shadowrocket_conf(trimmed)?
+    } else if contains_share_link_line(trimmed) {
+        // 3. Direct share links (one or multiple lines)
+        parse_share_link_lines(trimmed, ImportFormat::ShareLinks)?
+    } else if trimmed
         .lines()
         .any(|l| l.trim_start().starts_with("proxies:"))
     {
-        return clash_yaml::parse_clash_yaml(trimmed);
-    }
-
-    // 5. Base64-encoded subscription bundle of share links
-    if let Some(decoded) = try_decode_base64_utf8(trimmed) {
-        if contains_share_link_line(&decoded) {
-            return parse_share_link_lines(&decoded, ImportFormat::Base64ShareLinks);
+        // 4. Clash YAML (contains `proxies:` top-level key)
+        clash_yaml::parse_clash_yaml(trimmed)?
+    } else if let Some(decoded) = try_decode_base64_utf8(trimmed) {
+        // 5. Base64-encoded subscription bundle of share links
+        if decoded.len() > MAX_IMPORT_BYTES {
+            return Err(ParseError::InputTooLarge {
+                bytes: decoded.len(),
+                max_bytes: MAX_IMPORT_BYTES,
+            });
         }
+        if contains_share_link_line(&decoded) {
+            parse_share_link_lines(&decoded, ImportFormat::Base64ShareLinks)?
+        } else {
+            return Err(ParseError::UnrecognizedFormat);
+        }
+    } else {
+        return Err(ParseError::UnrecognizedFormat);
+    };
+
+    if bundle.nodes.len() > MAX_NODES_PER_IMPORT {
+        let orig = bundle.nodes.len();
+        bundle.nodes.truncate(MAX_NODES_PER_IMPORT);
+        bundle.parse_warnings.push(format!(
+            "节点数量超过单次导入上限（{orig} > {MAX_NODES_PER_IMPORT}），已截断保留前 {MAX_NODES_PER_IMPORT} 个"
+        ));
+    }
+    if bundle.rules.len() > MAX_RULES_PER_IMPORT {
+        let orig = bundle.rules.len();
+        bundle.rules.truncate(MAX_RULES_PER_IMPORT);
+        bundle.parse_warnings.push(format!(
+            "规则数量超过单次导入上限（{orig} > {MAX_RULES_PER_IMPORT}），已截断保留前 {MAX_RULES_PER_IMPORT} 条"
+        ));
     }
 
-    Err(ParseError::UnrecognizedFormat)
+    Ok(bundle)
 }
 
 pub(crate) fn extract_conf_section_header(line: &str) -> Option<String> {

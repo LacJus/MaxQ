@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use maxq_singbox_compiler::CompiledConfig;
+pub use maxq_win_service::protocol::redact_log_line;
 use maxq_win_service::protocol::detect_singbox_log_pin_mismatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -261,6 +262,33 @@ impl SingBoxSupervisor {
             );
         }
 
+        // Verify sing-box stays alive briefly (catches port conflicts / bad node params BEFORE
+        // the caller enables Windows System Proxy!)
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(Some(exit_status)) = child.try_wait() {
+                #[cfg(windows)]
+                drop(job_guard);
+                let _ = std::fs::remove_file(&config_path);
+                let tail = self
+                    .logs
+                    .lock()
+                    .map(|r| {
+                        r.iter()
+                            .rev()
+                            .take(6)
+                            .rev()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .unwrap_or_default();
+                return Err(RuntimeError::SpawnFailed(format!(
+                    "sing-box 内核启动后立即退出 ({exit_status}): {tail}"
+                )));
+            }
+        }
+
         self.child = Some(child);
         #[cfg(windows)]
         {
@@ -288,6 +316,40 @@ impl SingBoxSupervisor {
         Ok(pid)
     }
 
+    /// Checks whether the supervised `sing-box` child process is genuinely still alive.
+    /// If it crashed or was terminated externally, cleans up state + `active-config.json`
+    /// and returns `false` so the caller can immediately disable Windows System Proxy.
+    pub fn poll_alive(&mut self) -> bool {
+        let exited = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => return true,
+                Ok(Some(status)) => Some(status.code()),
+                Err(_) => Some(None),
+            },
+            None => return false,
+        };
+
+        self.child = None;
+        #[cfg(windows)]
+        {
+            self.job_guard.take();
+        }
+        self.remove_active_config_file();
+        self.clash_api_secret = None;
+        if let Ok(mut st) = self.status.lock() {
+            st.running = false;
+            st.pid = None;
+        }
+        let _ = self.events_tx.send(RuntimeEvent::Stopped {
+            exit_code: exited.flatten(),
+        });
+        false
+    }
+
+    fn remove_active_config_file(&self) {
+        let _ = std::fs::remove_file(self.runtime_dir.join("active-config.json"));
+    }
+
     pub async fn stop(&mut self) -> Result<(), RuntimeError> {
         let mut had_child = false;
         let mut exit_code = None;
@@ -300,6 +362,7 @@ impl SingBoxSupervisor {
         {
             self.job_guard.take();
         }
+        self.remove_active_config_file();
         if had_child {
             {
                 let mut st = self.status.lock().unwrap();
@@ -325,6 +388,7 @@ impl SingBoxSupervisor {
             // Dropping the KILL_ON_JOB_CLOSE handle forces Windows kernel to terminate sing-box immediately
             self.job_guard.take();
         }
+        self.remove_active_config_file();
         if had_child {
             if let Ok(mut st) = self.status.lock() {
                 st.running = false;
@@ -339,6 +403,86 @@ impl SingBoxSupervisor {
 impl Drop for SingBoxSupervisor {
     fn drop(&mut self) {
         self.stop_sync();
+    }
+}
+
+/// Process-wide single-instance guard preventing two concurrent MaxQ GUI instances from
+/// fighting over `sysproxy-backup.json`, SQLite vault, or localhost ports.
+pub struct SingleInstanceGuard {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for SingleInstanceGuard {}
+#[cfg(windows)]
+unsafe impl Sync for SingleInstanceGuard {}
+
+impl SingleInstanceGuard {
+    /// Acquires the per-user single-instance lock.
+    /// Returns `None` if another MaxQ instance is already running (and brings its window to front on Windows).
+    pub fn acquire_or_focus_existing(window_title: &str) -> Option<Self> {
+        #[cfg(windows)]
+        {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            use std::ptr::null;
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, GetLastError, ERROR_ALREADY_EXISTS,
+            };
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            };
+
+            let to_wide = |s: &str| -> Vec<u16> {
+                OsStr::new(s)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
+            };
+            let mutex_name = to_wide(r"Local\MaxQDesktopSingleInstanceMutex");
+            let handle = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
+            if handle.is_null() {
+                // Fail open if OS refuses mutex creation so app still starts
+                return Some(Self {
+                    handle: std::ptr::null_mut(),
+                });
+            }
+            let last_err = unsafe { GetLastError() };
+            if last_err == ERROR_ALREADY_EXISTS {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                let title_wide = to_wide(window_title);
+                let hwnd = unsafe { FindWindowW(null(), title_wide.as_ptr()) };
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+                return None;
+            }
+            Some(Self { handle })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = window_title;
+            Some(Self {})
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.handle);
+            }
+            self.handle = std::ptr::null_mut();
+        }
     }
 }
 
@@ -378,22 +522,6 @@ fn spawn_log_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             });
         }
     });
-}
-
-/// Redacts Bearer tokens and obvious inline secret/password fields before exposing logs to UI.
-pub fn redact_log_line(line: &str) -> String {
-    let mut out = line.to_string();
-    for marker in ["Bearer ", "secret=", "password="] {
-        if let Some(pos) = out.find(marker) {
-            let start = pos + marker.len();
-            let end = out[start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == ',' || c == '&')
-                .map(|i| start + i)
-                .unwrap_or(out.len());
-            out.replace_range(start..end, "<REDACTED>");
-        }
-    }
-    out
 }
 
 fn write_restricted_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

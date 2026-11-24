@@ -111,6 +111,7 @@ impl Drop for ServiceChildJobGuard {
 struct ServiceRuntimeState {
     child: Option<Child>,
     job_guard: Option<ServiceChildJobGuard>,
+    active_config_path: Option<PathBuf>,
     singbox_pid: Option<u32>,
     logs: Arc<Mutex<VecDeque<String>>>,
     last_mitm_alert: Arc<Mutex<Option<String>>>,
@@ -121,6 +122,7 @@ impl ServiceRuntimeState {
         Self {
             child: None,
             job_guard: None,
+            active_config_path: None,
             singbox_pid: None,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOGS))),
             last_mitm_alert: Arc::new(Mutex::new(None)),
@@ -133,6 +135,9 @@ impl ServiceRuntimeState {
             let _ = c.wait();
         }
         self.job_guard.take();
+        if let Some(cfg) = self.active_config_path.take() {
+            let _ = std::fs::remove_file(cfg);
+        }
         self.singbox_pid = None;
     }
 
@@ -143,6 +148,9 @@ impl ServiceRuntimeState {
                 _ => {
                     self.child = None;
                     self.job_guard.take();
+                    if let Some(cfg) = self.active_config_path.take() {
+                        let _ = std::fs::remove_file(cfg);
+                    }
                     self.singbox_pid = None;
                 }
             }
@@ -896,6 +904,8 @@ fn start_hardened_singbox_tun(
     // Brief check to catch immediate sing-box startup / wintun failures and return stderr clearly
     std::thread::sleep(Duration::from_millis(350));
     if let Ok(Some(exit_status)) = child.try_wait() {
+        drop(job_guard);
+        let _ = std::fs::remove_file(&cfg_path);
         let tail = logs_arc
             .lock()
             .map(|r| r.iter().rev().take(6).rev().cloned().collect::<Vec<_>>().join(" | "))
@@ -908,6 +918,7 @@ fn start_hardened_singbox_tun(
     let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
     rt.child = Some(child);
     rt.job_guard = job_guard;
+    rt.active_config_path = Some(cfg_path);
     rt.singbox_pid = Some(pid);
     Ok(pid)
 }
@@ -920,6 +931,7 @@ fn spawn_service_log_thread<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         let buf = BufReader::new(reader);
         for line in buf.lines().map_while(Result::ok) {
+            let redacted = crate::protocol::redact_log_line(&line);
             if let Some(spki) = crate::protocol::detect_singbox_log_pin_mismatch(&line) {
                 if let Ok(mut alert) = mitm_alert.lock() {
                     *alert = Some(spki);
@@ -929,7 +941,7 @@ fn spawn_service_log_thread<R: std::io::Read + Send + 'static>(
                 if ring.len() >= MAX_LOGS {
                     ring.pop_front();
                 }
-                ring.push_back(line);
+                ring.push_back(redacted);
             }
         }
     });

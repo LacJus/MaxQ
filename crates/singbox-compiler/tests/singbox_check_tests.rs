@@ -325,4 +325,21 @@ fn builtin_default_rules_and_tun_service_gate_pass_real_singbox_check() {
     assert_eq!(compiled_direct.json["route"]["final"], serde_json::json!("direct"));
     assert_eq!(compiled_direct.json["dns"]["final"], serde_json::json!("dns-direct"));
     verify_with_real_singbox(&compiled_direct.json, "direct_mode_tun");
+
+    // 4. Domain-based DoH URL (`https://dns.google/dns-query`) + `allow_lan=true` in TUN mode
+    policy.routing_mode = RoutingMode::Rule;
+    policy.allow_lan = true;
+    policy.remote_dns_server = "https://dns.google/dns-query".into();
+    let compiled_doh = compile_singbox_v14(&CompileInput {
+        active_node: &node,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &policy,
+    })
+    .unwrap();
+    let doh_cfg_str = serde_json::to_string(&compiled_doh.json).unwrap();
+    maxq_win_service::validator::validate_service_config(&doh_cfg_str)
+        .expect("domain DoH + allow_lan TUN config must satisfy hardened win-service validator");
+    verify_with_real_singbox(&compiled_doh.json, "domain_doh_tun");
 }

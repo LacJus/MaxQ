@@ -85,12 +85,18 @@ async fn starts_real_singbox_enforces_clash_api_bearer_auth_and_stops_cleanly() 
         .expect("start real sing-box");
     assert!(pid > 0);
 
-    // Wait for Started event
-    let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(ev, RuntimeEvent::Started { .. }));
+    // Wait for Started event (LogLine events may arrive first during the 250ms liveness check)
+    let mut saw_started = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if matches!(ev, RuntimeEvent::Started { .. }) {
+                saw_started = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_started, "expected RuntimeEvent::Started");
 
     // Give sing-box a brief moment to bind 127.0.0.1:29090
     let mut connected = false;
@@ -121,9 +127,16 @@ async fn starts_real_singbox_enforces_clash_api_bearer_auth_and_stops_cleanly() 
         "expected 200 OK with Bearer token, got:\n{auth_resp}"
     );
     assert!(auth_resp.contains("sing-box") || auth_resp.contains("1.14"));
+    assert!(supervisor.poll_alive(), "sing-box must report alive while running");
+    assert!(runtime_dir.join("active-config.json").exists());
 
     supervisor.stop().await.expect("stop sing-box");
     assert!(!supervisor.status().running);
+    assert!(!supervisor.poll_alive());
+    assert!(
+        !runtime_dir.join("active-config.json").exists(),
+        "plaintext active-config.json must be removed on stop"
+    );
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
 
