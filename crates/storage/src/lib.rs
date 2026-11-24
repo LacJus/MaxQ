@@ -342,6 +342,44 @@ impl VaultStore {
         Ok(())
     }
 
+    pub fn rename_profile(
+        &mut self,
+        profile_id: &str,
+        new_name: impl Into<String>,
+    ) -> Result<(), StorageError> {
+        let trimmed = new_name.into().trim().to_string();
+        if trimmed.is_empty() {
+            return Err(StorageError::NotFound("profile name cannot be empty".into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let affected = self.conn.execute(
+            "UPDATE profiles SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![trimmed, now, profile_id],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!("profile {profile_id}")));
+        }
+        Ok(())
+    }
+
+    /// Returns `(total_profiles, total_nodes, pinned_spki_nodes)` for the About / Telemetry overview.
+    pub fn vault_stats(&self) -> Result<(usize, usize, usize), StorageError> {
+        let profiles: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM profiles", [], |r| r.get(0))?;
+        let nodes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let pinned: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM trust_vault", [], |r| r.get(0))?;
+        Ok((
+            profiles.max(0) as usize,
+            nodes.max(0) as usize,
+            pinned.max(0) as usize,
+        ))
+    }
+
     pub fn get_trust_record(&self, node_id: &str) -> Result<Option<TrustRecord>, StorageError> {
         let json: Option<String> = self
             .conn

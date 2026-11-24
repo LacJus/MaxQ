@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maxq_cert_probe::{
     apply_confirmed_pin, evaluate_probe_against_node, probe_certificate, probe_tcp_latency_ms,
@@ -20,12 +20,22 @@ use maxq_sanitizer::{
 };
 use maxq_singbox_compiler::{builtin_default_rules_count, compile_singbox_v14, CompileInput};
 use maxq_storage::{ProfileSummary, StoredProfile, VaultStore};
-use maxq_win_service::protocol::TunServiceStatus;
+use maxq_win_service::protocol::{TunServiceStatus, SERVICE_PROTOCOL_VERSION};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+
+pub struct ActiveClashApiSession {
+    pub port: u16,
+    pub secret: String,
+    pub started_at: Instant,
+    pub prev_upload_total: u64,
+    pub prev_download_total: u64,
+    pub prev_sample_at: Option<Instant>,
+}
 
 pub struct AppState {
     pub store: Mutex<VaultStore>,
@@ -33,6 +43,7 @@ pub struct AppState {
     pub sysproxy: Mutex<SystemProxyManager>,
     pub service_exe_path: Option<PathBuf>,
     pub tun_active_node: Mutex<Option<(String, String)>>,
+    pub clash_api_session: Mutex<Option<ActiveClashApiSession>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +65,48 @@ pub struct BatchPinSummary {
 pub struct BuiltinRulesInfo {
     pub rule_count: usize,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveConnectionItem {
+    pub id: String,
+    pub host: String,
+    pub port: String,
+    pub network: String,
+    pub rule: String,
+    pub chain: String,
+    pub upload: u64,
+    pub download: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RuntimeTelemetry {
+    pub connected: bool,
+    pub upload_bps: u64,
+    pub download_bps: u64,
+    pub upload_total: u64,
+    pub download_total: u64,
+    pub active_connections: usize,
+    pub uptime_secs: u64,
+    /// Normalized 0..=100 aerodynamic dynamic pressure index ("Max-Q") derived from real throughput & connections.
+    pub dynamic_pressure_q: f32,
+    pub recent_connections: Vec<LiveConnectionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AboutInfo {
+    pub app_name: String,
+    pub app_version: String,
+    pub engine_brand: String,
+    pub core_version: String,
+    pub creator: String,
+    pub os: String,
+    pub arch: String,
+    pub builtin_rule_count: usize,
+    pub service_protocol_version: String,
+    pub total_profiles: usize,
+    pub total_nodes: usize,
+    pub pinned_spki_nodes: usize,
 }
 
 #[tauri::command]
@@ -261,6 +314,85 @@ fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), 
 }
 
 #[tauri::command]
+fn rename_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    new_name: String,
+) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .rename_profile(&profile_id, new_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_about_info(state: State<'_, AppState>) -> Result<AboutInfo, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let (total_profiles, total_nodes, pinned_spki_nodes) =
+        store.vault_stats().map_err(|e| e.to_string())?;
+    Ok(AboutInfo {
+        app_name: "MaxQ".to_string(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_brand: "JaxCore · sing-box".to_string(),
+        core_version: "1.14.4".to_string(),
+        creator: "JucStudio · Neon".to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        builtin_rule_count: builtin_default_rules_count(),
+        service_protocol_version: SERVICE_PROTOCOL_VERSION.to_string(),
+        total_profiles,
+        total_nodes,
+        pinned_spki_nodes,
+    })
+}
+
+#[tauri::command]
+async fn export_diagnostics_summary(state: State<'_, AppState>) -> Result<String, String> {
+    let (stats, policy) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let stats = store.vault_stats().map_err(|e| e.to_string())?;
+        let policy = store.load_runtime_policy().map_err(|e| e.to_string())?;
+        (stats, policy)
+    };
+    let tun = tokio::task::spawn_blocking(TunServiceClient::query_status)
+        .await
+        .unwrap_or_default();
+    let summary = format!(
+        "=== MaxQ Redacted Diagnostics ===\n\
+         App: MaxQ v{} ({}/{})\n\
+         Engine: Powered by JaxCore · sing-box v1.14.4\n\
+         Creator: JucStudio · Neon\n\
+         Vault: {} profiles / {} nodes / {} SPKI pinned\n\
+         Builtin Rules: {} generic sanitized rules\n\
+         Policy: proxy_mode={:?}, routing_mode={:?}, rule_source={:?}, ipv6={:?}\n\
+         Ports: mixed=127.0.0.1:{}, clash_api=127.0.0.1:{}\n\
+         TUN Service: installed={}, running={}, tun_active={}, sha256_ok={}, proto={:?}\n\
+         TUN Last Error: {}\n\
+         (Zero secrets, passwords, UUIDs, or private node addresses included)",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        stats.0,
+        stats.1,
+        stats.2,
+        builtin_default_rules_count(),
+        policy.proxy_mode,
+        policy.routing_mode,
+        policy.rule_source,
+        policy.ipv6_mode,
+        policy.mixed_listen_port,
+        policy.clash_api_port,
+        tun.installed,
+        tun.running,
+        tun.tun_active,
+        tun.singbox_sha256_verified,
+        tun.version,
+        tun.last_error.as_deref().unwrap_or("none"),
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
 fn update_profile_hosts(
     state: State<'_, AppState>,
     profile_id: String,
@@ -287,6 +419,43 @@ async fn test_node_latency(state: State<'_, AppState>, node_id: String) -> Resul
     probe_tcp_latency_ms(node.effective_dial_server(), node.server_port, 4_000)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn batch_test_latencies(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<HashMap<String, Option<u64>>, String> {
+    let targets: Vec<(String, String, u16)> = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let profile = store.get_profile(&profile_id).map_err(|e| e.to_string())?;
+        profile
+            .nodes
+            .into_iter()
+            .filter(|n| !n.is_metadata_node)
+            .take(64)
+            .map(|n| (n.id.clone(), n.effective_dial_server().to_string(), n.server_port))
+            .collect()
+    };
+
+    let sem = Arc::new(Semaphore::new(10));
+    let mut join_set = tokio::task::JoinSet::new();
+    for (id, host, port) in targets {
+        let sem_clone = Arc::clone(&sem);
+        join_set.spawn(async move {
+            let _permit = sem_clone.acquire_owned().await;
+            let ms = probe_tcp_latency_ms(&host, port, 3_500).await.ok();
+            (id, ms)
+        });
+    }
+
+    let mut out = HashMap::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((id, ms)) = res {
+            out.insert(id, ms);
+        }
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -485,6 +654,9 @@ async fn start_proxy(
         let _ = sp.disable_and_restore();
     }
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+    if let Ok(mut guard) = state.clash_api_session.lock() {
+        *guard = None;
+    }
 
     if use_tun {
         let cfg_json = serde_json::to_string(&compiled.json).map_err(|e| e.to_string())?;
@@ -494,6 +666,16 @@ async fn start_proxy(
             .map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.tun_active_node.lock() {
             *guard = Some((node.id.clone(), node.name.clone()));
+        }
+        if let Ok(mut guard) = state.clash_api_session.lock() {
+            *guard = Some(ActiveClashApiSession {
+                port: policy.clash_api_port,
+                secret: compiled.clash_api_secret.clone(),
+                started_at: Instant::now(),
+                prev_upload_total: 0,
+                prev_download_total: 0,
+                prev_sample_at: None,
+            });
         }
         return Ok(RuntimeStatus {
             running: true,
@@ -523,6 +705,17 @@ async fn start_proxy(
     .await
     .map_err(|e| e.to_string())?;
 
+    if let Ok(mut guard) = state.clash_api_session.lock() {
+        *guard = Some(ActiveClashApiSession {
+            port: policy.clash_api_port,
+            secret: compiled.clash_api_secret.clone(),
+            started_at: Instant::now(),
+            prev_upload_total: 0,
+            prev_download_total: 0,
+            prev_sample_at: None,
+        });
+    }
+
     let mut status = sup.status();
     if enable_system_proxy {
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
@@ -543,12 +736,180 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
     }
+    if let Ok(mut guard) = state.clash_api_session.lock() {
+        *guard = None;
+    }
     let mut sup = state.supervisor.lock().await;
     sup.stop().await.map_err(|e| e.to_string())?;
     let mut status = sup.status();
     status.system_proxy_enabled = false;
     status.tun_active = false;
     Ok(status)
+}
+
+/// Queries the local loopback Clash API (`/connections`) strictly from Rust with Bearer auth
+/// (never exposing the Clash API secret to the WebView) and computes live throughput & Max-Q index.
+#[tauri::command]
+async fn get_runtime_telemetry(state: State<'_, AppState>) -> Result<RuntimeTelemetry, String> {
+    let session_meta = {
+        let guard = state.clash_api_session.lock().map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .map(|s| (s.port, s.secret.clone(), s.started_at))
+    };
+    let Some((port, secret, started_at)) = session_meta else {
+        return Ok(RuntimeTelemetry::default());
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(1200))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("http://127.0.0.1:{port}/connections");
+    let resp = match client.get(&url).bearer_auth(&secret).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            return Ok(RuntimeTelemetry {
+                connected: true,
+                uptime_secs: started_at.elapsed().as_secs(),
+                ..RuntimeTelemetry::default()
+            });
+        }
+    };
+
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let root: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let upload_total = root
+        .get("uploadTotal")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let download_total = root
+        .get("downloadTotal")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let now = Instant::now();
+    let (upload_bps, download_bps) = {
+        let mut guard = state.clash_api_session.lock().map_err(|e| e.to_string())?;
+        if let Some(sess) = guard.as_mut() {
+            let rates = if let Some(prev_at) = sess.prev_sample_at {
+                let dt = now.duration_since(prev_at).as_secs_f64().max(0.25);
+                let du = upload_total.saturating_sub(sess.prev_upload_total) as f64;
+                let dd = download_total.saturating_sub(sess.prev_download_total) as f64;
+                ((du / dt) as u64, (dd / dt) as u64)
+            } else {
+                (0, 0)
+            };
+            sess.prev_upload_total = upload_total;
+            sess.prev_download_total = download_total;
+            sess.prev_sample_at = Some(now);
+            rates
+        } else {
+            (0, 0)
+        }
+    };
+
+    let conns_arr = root
+        .get("connections")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active_connections = conns_arr.len();
+
+    let mut recent_connections = Vec::with_capacity(conns_arr.len().min(15));
+    for c in conns_arr.iter().rev().take(15) {
+        let meta = c.get("metadata").unwrap_or(&Value::Null);
+        let host = meta
+            .get("host")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| meta.get("destinationIP").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+        let port = meta
+            .get("destinationPort")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let network = meta
+            .get("network")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tcp")
+            .to_string();
+        let rule = c
+            .get("rule")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Match")
+            .to_string();
+        let chain = c
+            .get("chains")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("direct")
+            .to_string();
+        let id = c
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let upload = c.get("upload").and_then(|v| v.as_u64()).unwrap_or(0);
+        let download = c.get("download").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        recent_connections.push(LiveConnectionItem {
+            id,
+            host,
+            port,
+            network,
+            rule,
+            chain,
+            upload,
+            download,
+        });
+    }
+
+    // Max-Q Dynamic Pressure index (0..=100): smooth log-scale blend of throughput + concurrency
+    let total_bps = (upload_bps + download_bps) as f64;
+    let speed_factor = if total_bps <= 1.0 {
+        0.0
+    } else {
+        ((total_bps.log10() - 2.0) / 5.5).clamp(0.0, 1.0)
+    };
+    let conn_factor = ((active_connections as f64) / 40.0).clamp(0.0, 1.0);
+    let dynamic_pressure_q = ((speed_factor * 0.78 + conn_factor * 0.22) * 100.0) as f32;
+
+    Ok(RuntimeTelemetry {
+        connected: true,
+        upload_bps,
+        download_bps,
+        upload_total,
+        download_total,
+        active_connections,
+        uptime_secs: started_at.elapsed().as_secs(),
+        dynamic_pressure_q,
+        recent_connections,
+    })
+}
+
+#[tauri::command]
+async fn close_all_connections(state: State<'_, AppState>) -> Result<(), String> {
+    let session_meta = {
+        let guard = state.clash_api_session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().map(|s| (s.port, s.secret.clone()))
+    };
+    let Some((port, secret)) = session_meta else {
+        return Ok(());
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("http://127.0.0.1:{port}/connections");
+    let _ = client.delete(&url).bearer_auth(&secret).send().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -670,6 +1031,7 @@ pub fn run() {
                 sysproxy: Mutex::new(sysproxy),
                 service_exe_path,
                 tun_active_node: Mutex::new(None),
+                clash_api_session: Mutex::new(None),
             });
 
             // Build system tray for quick show/hide and clean quit
@@ -680,7 +1042,7 @@ pub fn run() {
 
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("MaxQ — Secure sing-box Client")
+                .tooltip("MaxQ — Powered by JaxCore sing-box")
                 .on_menu_event(|app_handle, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(w) = app_handle.get_webview_window("main") {
@@ -738,14 +1100,20 @@ pub fn run() {
             list_profiles,
             get_profile,
             delete_profile,
+            rename_profile,
+            get_about_info,
+            export_diagnostics_summary,
             update_profile_hosts,
             test_node_latency,
+            batch_test_latencies,
             probe_node_certificate,
             batch_probe_and_pin_profile,
             confirm_node_pin,
             set_insecure_override,
             start_proxy,
             stop_proxy,
+            get_runtime_telemetry,
+            close_all_connections,
             get_runtime_status,
             get_runtime_logs,
             get_runtime_policy,

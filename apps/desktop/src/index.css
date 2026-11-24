@@ -1,13 +1,107 @@
 @import "tailwindcss";
 
-:root {
+/* ==========================================================================
+   MaxQ Design System — Flat Lively Periwinkle (晴岚浅蓝紫) + Twilight Indigo
+   ========================================================================== */
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --mq-bg: #f3f5fd;
+  --mq-rail: #ebeefd;
+  --mq-card: #ffffff;
+  --mq-subtle: #f7f8fe;
+  --mq-hover: #eef1ff;
+  --mq-border: #dce1f8;
+  --mq-border-strong: #c2cbf4;
+  --mq-ink: #1b2042;
+  --mq-ink-2: #58608a;
+  --mq-ink-3: #8991b8;
+  --mq-log-bg: #181c33;
+  --mq-log-ink: #dbe2ff;
+
+  /* Semantic Flat Surfaces */
+  --mq-ok: #0ea572;
+  --mq-ok-bg: #e7faf3;
+  --mq-ok-border: #bfeeda;
+  --mq-warn: #c77708;
+  --mq-warn-bg: #fef6e6;
+  --mq-warn-border: #f8deaa;
+  --mq-danger: #d92654;
+  --mq-danger-bg: #fff0f4;
+  --mq-danger-border: #fcc8d6;
+
+  /* Default Accent: Periwinkle (浅蓝紫) */
+  --mq-accent: #6b7cff;
+  --mq-accent-2: #9281ff;
+  --mq-accent-hover: #5666f5;
+  --mq-accent-soft: #e7eaff;
+  --mq-accent-soft-2: #f0edff;
+  --mq-accent-ink: #4450d8;
+  --mq-on-accent: #ffffff;
+}
+
+[data-theme="dark"] {
   color-scheme: dark;
-  --mq-bg: #090c10;
-  --mq-surface: #0f141c;
-  --mq-elevated: #151c27;
-  --mq-hover: #1b2432;
-  --mq-border: rgba(148, 163, 184, 0.12);
-  --mq-border-strong: rgba(148, 163, 184, 0.22);
+  --mq-bg: #131628;
+  --mq-rail: #171b31;
+  --mq-card: #1e233e;
+  --mq-subtle: #252b4a;
+  --mq-hover: #2b3256;
+  --mq-border: rgba(165, 178, 255, 0.14);
+  --mq-border-strong: rgba(165, 178, 255, 0.28);
+  --mq-ink: #eef1ff;
+  --mq-ink-2: #a5afd6;
+  --mq-ink-3: #7680ac;
+  --mq-log-bg: #0f1222;
+  --mq-log-ink: #d4dcff;
+
+  --mq-ok: #34d399;
+  --mq-ok-bg: rgba(16, 185, 129, 0.14);
+  --mq-ok-border: rgba(52, 211, 153, 0.28);
+  --mq-warn: #fbbf24;
+  --mq-warn-bg: rgba(245, 158, 11, 0.14);
+  --mq-warn-border: rgba(251, 191, 36, 0.28);
+  --mq-danger: #fb7185;
+  --mq-danger-bg: rgba(244, 63, 94, 0.14);
+  --mq-danger-border: rgba(251, 113, 133, 0.28);
+
+  --mq-accent: #7b8aff;
+  --mq-accent-2: #a28eff;
+  --mq-accent-hover: #8d9bff;
+  --mq-accent-soft: rgba(123, 138, 255, 0.16);
+  --mq-accent-soft-2: rgba(162, 142, 255, 0.14);
+  --mq-accent-ink: #bcc6ff;
+  --mq-on-accent: #ffffff;
+}
+
+/* Optional Accent Flavors (always staying within airy blue-violet family) */
+[data-accent="glacier"] {
+  --mq-accent: #5588ff;
+  --mq-accent-2: #769eff;
+  --mq-accent-hover: #3f75f5;
+  --mq-accent-soft: #e6f0ff;
+  --mq-accent-ink: #2c5cd4;
+}
+[data-theme="dark"][data-accent="glacier"] {
+  --mq-accent: #6b9cff;
+  --mq-accent-2: #8bb2ff;
+  --mq-accent-soft: rgba(107, 156, 255, 0.18);
+  --mq-accent-ink: #b8d1ff;
+}
+
+[data-accent="lilac"] {
+  --mq-accent: #8574ff;
+  --mq-accent-2: #a98bff;
+  --mq-accent-hover: #715ef2;
+  --mq-accent-soft: #eeeaff;
+  --mq-accent-ink: #5d47d6;
+}
+[data-theme="dark"][data-accent="lilac"] {
+  --mq-accent: #9a8bff;
+  --mq-accent-2: #ba9eff;
+  --mq-accent-soft: rgba(154, 139, 255, 0.18);
+  --mq-accent-ink: #d4cbff;
 }
 
 html,
@@ -15,9 +109,17 @@ body,
 #root {
   height: 100%;
   background-color: var(--mq-bg);
-  color: #e6edf3;
-  font-family: "Inter", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+  color: var(--mq-ink);
+  font-family: "Inter", "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",
+    system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+  transition: background-color 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    color 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+::selection {
+  background-color: var(--mq-accent-soft);
+  color: var(--mq-accent-ink);
 }
 
 .font-mono-tabular {
@@ -25,23 +127,175 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+/* Flat Architectural Surfaces */
+.mq-rail {
+  background-color: var(--mq-rail);
+  border-right: 1px solid var(--mq-border);
+}
+
 .mq-panel {
-  background-color: var(--mq-surface);
+  background-color: var(--mq-card);
+  border: 1px solid var(--mq-border);
+  transition: border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.mq-subtle {
+  background-color: var(--mq-subtle);
   border: 1px solid var(--mq-border);
 }
 
+/* Lively Tactile Card Motion (flat lift + crisp border shift, zero heavy shadows) */
 .mq-card {
-  background-color: var(--mq-elevated);
+  background-color: var(--mq-card);
   border: 1px solid var(--mq-border);
-  transition: border-color 140ms ease, background-color 140ms ease, transform 140ms ease;
+  transition: transform 210ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 180ms ease,
+    background-color 180ms ease;
 }
 
 .mq-card:hover {
   border-color: var(--mq-border-strong);
-  background-color: var(--mq-hover);
+  transform: translateY(-2px);
+}
+
+.mq-card-active {
+  background-color: var(--mq-accent-soft);
+  border: 1px solid var(--mq-accent);
+}
+
+.mq-btn {
+  transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease;
+}
+
+.mq-btn:active:not(:disabled) {
+  transform: scale(0.975);
+}
+
+.mq-btn-primary {
+  background: linear-gradient(135deg, var(--mq-accent), var(--mq-accent-2));
+  color: var(--mq-on-accent);
+}
+
+.mq-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+.mq-nav-item {
+  transition: background-color 170ms cubic-bezier(0.22, 1, 0.36, 1),
+    color 170ms ease,
+    transform 170ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.mq-nav-item:hover {
+  transform: translateX(2px);
+}
+
+/* Subtle Flat Kinetic Keyframes */
+@keyframes mq-fade-slide {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mq-enter {
+  animation: mq-fade-slide 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes mq-orbit-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.mq-radar-sweep {
+  transform-origin: 160px 160px;
+  animation: mq-orbit-spin 2.4s linear infinite;
+}
+
+@keyframes mq-float {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+.mq-float {
+  animation: mq-float 3.2s ease-in-out infinite;
+}
+
+@keyframes mq-pulse-soft {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.75;
+  }
+  70% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+
+.mq-pulse-ring {
+  animation: mq-pulse-soft 2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+@keyframes mq-rocket-flight {
+  0% {
+    transform: translate(-18vw, 35vh) rotate(-28deg) scale(0.85);
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  55% {
+    transform: translate(42vw, -6vh) rotate(-32deg) scale(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(108vw, -54vh) rotate(-35deg) scale(0.9);
+    opacity: 0;
+  }
+}
+
+.mq-rocket-arc {
+  animation: mq-rocket-flight 2.6s cubic-bezier(0.25, 0.9, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mq-enter,
+  .mq-radar-sweep,
+  .mq-float,
+  .mq-pulse-ring,
+  .mq-rocket-arc {
+    animation: none !important;
+  }
+  .mq-card:hover,
+  .mq-nav-item:hover,
+  .mq-btn:active {
+    transform: none !important;
+  }
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(100, 116, 139, 0.35) transparent;
+  scrollbar-color: var(--mq-border-strong) transparent;
 }

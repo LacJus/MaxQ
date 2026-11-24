@@ -178,9 +178,49 @@ export interface RuntimeStatus {
   last_mitm_alert?: string;
 }
 
+export interface LiveConnectionItem {
+  id: string;
+  host: string;
+  port: string;
+  network: string;
+  rule: string;
+  chain: string;
+  upload: number;
+  download: number;
+}
+
+export interface RuntimeTelemetry {
+  connected: boolean;
+  upload_bps: number;
+  download_bps: number;
+  upload_total: number;
+  download_total: number;
+  active_connections: number;
+  uptime_secs: number;
+  dynamic_pressure_q: number;
+  recent_connections: LiveConnectionItem[];
+}
+
+export interface AboutInfo {
+  app_name: string;
+  app_version: string;
+  engine_brand: string;
+  core_version: string;
+  creator: string;
+  os: string;
+  arch: string;
+  builtin_rule_count: number;
+  service_protocol_version: string;
+  total_profiles: number;
+  total_nodes: number;
+  pinned_spki_nodes: number;
+}
+
 export type ProxyMode = "system_proxy" | "tun";
 export type RoutingMode = "rule" | "global" | "direct";
 export type RuleSource = "builtin_default" | "profile_or_builtin";
+export type ThemeMode = "light" | "dark";
+export type AccentFlavor = "periwinkle" | "glacier" | "lilac";
 
 export interface RuntimePolicy {
   mixed_listen_port: number;

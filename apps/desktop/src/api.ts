@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AboutInfo,
   BatchPinSummary,
   BuiltinRulesInfo,
   HostEntry,
@@ -8,6 +9,7 @@ import type {
   ProfileSummary,
   RuntimePolicy,
   RuntimeStatus,
+  RuntimeTelemetry,
   SanitizedImport,
   StoredProfile,
   TrustRecord,
@@ -20,6 +22,10 @@ export function isTauriRuntime(): boolean {
 
 export const api = {
   getBuiltinRulesInfo: () => invoke<BuiltinRulesInfo>("get_builtin_rules_info"),
+
+  getAboutInfo: () => invoke<AboutInfo>("get_about_info"),
+
+  exportDiagnosticsSummary: () => invoke<string>("export_diagnostics_summary"),
 
   getTunServiceStatus: () => invoke<TunServiceStatus>("get_tun_service_status"),
 
@@ -44,11 +50,17 @@ export const api = {
   deleteProfile: (profileId: string) =>
     invoke<void>("delete_profile", { profileId }),
 
+  renameProfile: (profileId: string, newName: string) =>
+    invoke<void>("rename_profile", { profileId, newName }),
+
   updateProfileHosts: (profileId: string, hosts: HostEntry[]) =>
     invoke<StoredProfile>("update_profile_hosts", { profileId, hosts }),
 
   testNodeLatency: (nodeId: string) =>
     invoke<number>("test_node_latency", { nodeId }),
+
+  batchTestLatencies: (profileId: string) =>
+    invoke<Record<string, number | null>>("batch_test_latencies", { profileId }),
 
   probeNodeCertificate: (nodeId: string) =>
     invoke<ProbeNodeResult>("probe_node_certificate", { nodeId }),
@@ -68,6 +80,10 @@ export const api = {
   stopProxy: () => invoke<RuntimeStatus>("stop_proxy"),
 
   getRuntimeStatus: () => invoke<RuntimeStatus>("get_runtime_status"),
+
+  getRuntimeTelemetry: () => invoke<RuntimeTelemetry>("get_runtime_telemetry"),
+
+  closeAllConnections: () => invoke<void>("close_all_connections"),
 
   getRuntimeLogs: () => invoke<string[]>("get_runtime_logs"),
 

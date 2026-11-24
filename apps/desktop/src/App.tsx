@@ -1,19 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertTriangle,
-  CheckCircle2,
+  Check,
+  Command,
+  Copy,
   Cpu,
-  Download,
-  FileText,
+  Edit3,
   Gauge,
   Globe,
+  Info,
   KeyRound,
-  Link2,
   Lock,
+  Moon,
   Network,
+  Palette,
   Plus,
   Power,
+  Radar,
   RefreshCw,
   Search,
   Server,
@@ -22,13 +26,25 @@ import {
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  Sun,
   Terminal,
   Trash2,
-  Upload,
   X,
 } from "lucide-react";
 import { api, isTauriRuntime } from "./api";
+import { AboutView } from "./components/AboutView";
+import { CommandPalette } from "./components/CommandPalette";
+import { ImportModal, type ImportMethod } from "./components/ImportModal";
+import { LaunchEasterEgg } from "./components/LaunchEasterEgg";
+import { MaxQLogo } from "./components/MaxQLogo";
+import { OrbitalRadar } from "./components/OrbitalRadar";
+import { ProbeDrawer } from "./components/ProbeDrawer";
+import { SpkiSigil } from "./components/SpkiSigil";
+import { TelemetryRibbon, type SpeedSample } from "./components/TelemetryRibbon";
+import { playSoftTone } from "./sound";
 import type {
+  AboutInfo,
+  AccentFlavor,
   BatchPinSummary,
   BuiltinRulesInfo,
   NodeConfig,
@@ -38,19 +54,20 @@ import type {
   RoutingMode,
   RuntimePolicy,
   RuntimeStatus,
+  RuntimeTelemetry,
   SanitizedImport,
   StoredProfile,
+  ThemeMode,
   TunServiceStatus,
 } from "./types";
 
-type Tab = "nodes" | "security" | "logs" | "settings";
-type ImportMethod = "paste" | "file" | "url";
+type Tab = "nodes" | "radar" | "security" | "logs" | "settings" | "about";
 
 const PROTOCOL_FILTERS: Array<{ id: string; label: string }> = [
   { id: "all", label: "全部" },
   { id: "trojan", label: "Trojan" },
   { id: "any_tls", label: "AnyTLS" },
-  { id: "hysteria2", label: "Hysteria2" },
+  { id: "hysteria2", label: "Hy2" },
   { id: "tuic", label: "TUIC" },
   { id: "vless", label: "VLESS" },
   { id: "vmess", label: "VMess" },
@@ -79,8 +96,9 @@ function protocolLabel(p: NodeConfig["protocol"]["type"]): string {
 function tlsBadge(node: NodeConfig) {
   if (!node.tls.enabled) {
     return {
-      label: "明文/无 TLS",
-      cls: "bg-slate-800/90 text-slate-400",
+      label: "明文 / 无 TLS",
+      bg: "var(--mq-subtle)",
+      color: "var(--mq-ink-3)",
       icon: Globe,
     };
   }
@@ -88,45 +106,94 @@ function tlsBadge(node: NodeConfig) {
     case "pinned_spki":
       return {
         label: "SPKI 已固定",
-        cls: "bg-emerald-500/12 text-emerald-300",
+        bg: "var(--mq-ok-bg)",
+        color: "var(--mq-ok)",
         icon: ShieldCheck,
       };
     case "system_ca":
       return {
-        label: "CA 校验",
-        cls: "bg-sky-500/12 text-sky-300",
+        label: "系统 CA",
+        bg: "var(--mq-accent-soft)",
+        color: "var(--mq-accent-ink)",
         icon: Lock,
       };
     case "pending_pin_bootstrap":
       return {
         label: "待核验 pcs",
-        cls: "bg-amber-500/15 text-amber-300",
+        bg: "var(--mq-warn-bg)",
+        color: "var(--mq-warn)",
         icon: KeyRound,
       };
     case "insecure_legacy":
       return node.tls.verify_mode.user_confirmed_override
         ? {
             label: "临时放行",
-            cls: "bg-orange-500/15 text-orange-300",
+            bg: "var(--mq-warn-bg)",
+            color: "var(--mq-warn)",
             icon: AlertTriangle,
           }
         : {
-            label: "未验证 (已阻断)",
-            cls: "bg-rose-500/15 text-rose-300",
+            label: "待验证 (已阻断)",
+            bg: "var(--mq-danger-bg)",
+            color: "var(--mq-danger)",
             icon: ShieldAlert,
           };
+  }
+}
+
+const DEFAULT_ABOUT: AboutInfo = {
+  app_name: "MaxQ",
+  app_version: "0.3.0",
+  engine_brand: "JaxCore · sing-box",
+  core_version: "1.14.4",
+  creator: "JucStudio · Neon",
+  os: "windows",
+  arch: "x86_64",
+  builtin_rule_count: 8581,
+  service_protocol_version: "1.0.1",
+  total_profiles: 0,
+  total_nodes: 0,
+  pinned_spki_nodes: 0,
+};
+
+const EMPTY_HISTORY: SpeedSample[] = Array.from({ length: 28 }, () => ({ up: 0, down: 0 }));
+
+function loadPref<T extends string>(key: string, fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return (v as T) || fallback;
+  } catch {
+    return fallback;
   }
 }
 
 export default function App() {
   const inTauri = isTauriRuntime();
   const [tab, setTab] = useState<Tab>("nodes");
+
+  // Theme & Fun Lab Preferences (persisted locally)
+  const [theme, setTheme] = useState<ThemeMode>(() => loadPref<ThemeMode>("maxq.theme", "light"));
+  const [accent, setAccent] = useState<AccentFlavor>(() =>
+    loadPref<AccentFlavor>("maxq.accent", "periwinkle")
+  );
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(
+    () => loadPref<"on" | "off">("maxq.sound", "off") === "on"
+  );
+  const [logoClicks, setLogoClicks] = useState(0);
+  const [launchKey, setLaunchKey] = useState(0);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // Core Vault & Runtime State
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [profile, setProfile] = useState<StoredProfile | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+
+  const [aboutInfo, setAboutInfo] = useState<AboutInfo>(DEFAULT_ABOUT);
   const [builtinRules, setBuiltinRules] = useState<BuiltinRulesInfo>({
     rule_count: 8581,
-    description: "MaxQ 内置默认分流规则",
+    description: "MaxQ 内置默认分流规则（国内直连域名 + CN IP-CIDR + 海外代理，已完全脱敏）",
   });
   const [tunService, setTunService] = useState<TunServiceStatus>({
     installed: false,
@@ -139,7 +206,21 @@ export default function App() {
     system_proxy_enabled: false,
     tun_active: false,
   });
+  const [telemetry, setTelemetry] = useState<RuntimeTelemetry>({
+    connected: false,
+    upload_bps: 0,
+    download_bps: 0,
+    upload_total: 0,
+    download_total: 0,
+    active_connections: 0,
+    uptime_secs: 0,
+    dynamic_pressure_q: 0,
+    recent_connections: [],
+  });
+  const [speedHistory, setSpeedHistory] = useState<SpeedSample[]>(EMPTY_HISTORY);
   const [logs, setLogs] = useState<string[]>([]);
+  const [logFilter, setLogFilter] = useState("");
+
   const [policy, setPolicy] = useState<RuntimePolicy>({
     mixed_listen_port: 17890,
     allow_lan: false,
@@ -155,15 +236,16 @@ export default function App() {
     direct_dns_server: "223.5.5.5",
   });
 
-  // Search, filter, latency & batch pin state
+  // Search, filter, latency & batch actions
   const [searchQuery, setSearchQuery] = useState("");
   const [protoFilter, setProtoFilter] = useState("all");
   const [latencies, setLatencies] = useState<Record<string, number | "err" | "loading">>({});
+  const [scanningOrbit, setScanningOrbit] = useState(false);
   const [batchPinning, setBatchPinning] = useState(false);
   const [tunBusy, setTunBusy] = useState(false);
   const [toast, setToast] = useState<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 
-  // Import modal state
+  // Import Modal State
   const [importOpen, setImportOpen] = useState(false);
   const [importMethod, setImportMethod] = useState<ImportMethod>("paste");
   const [importName, setImportName] = useState("新导入配置");
@@ -173,26 +255,75 @@ export default function App() {
   const [approvedHostDomains, setApprovedHostDomains] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
 
-  // TLS TOFU Probe Drawer state
+  // TLS TOFU Probe Drawer State
   const [inspectNode, setInspectNode] = useState<NodeConfig | null>(null);
   const [probeResult, setProbeResult] = useState<ProbeNodeResult | null>(null);
   const [probeLoading, setProbeLoading] = useState(false);
   const [probeError, setProbeError] = useState<string | null>(null);
 
-  const showToast = (kind: "info" | "ok" | "err", text: string) => {
+  // Apply theme & accent tokens on <html>
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.setAttribute("data-accent", accent);
+    try {
+      localStorage.setItem("maxq.theme", theme);
+      localStorage.setItem("maxq.accent", accent);
+      localStorage.setItem("maxq.sound", soundEnabled ? "on" : "off");
+    } catch {
+      // ignore storage errors
+    }
+  }, [theme, accent, soundEnabled]);
+
+  // Auto-dismiss transient info/ok toast
+  useEffect(() => {
+    if (!toast || toast.kind === "err") return;
+    const t = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Ctrl+K / Cmd+K Quick Command Palette shortcut
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const showToast = useCallback((kind: "info" | "ok" | "err", text: string) => {
     setToast({ kind, text });
+  }, []);
+
+  const triggerLaunch = useCallback(() => {
+    setLaunchKey((k) => k + 1);
+    if (soundEnabled) playSoftTone("launch");
+  }, [soundEnabled]);
+
+  const handleLogoTap = () => {
+    const next = logoClicks + 1;
+    if (next >= 5) {
+      setLogoClicks(0);
+      triggerLaunch();
+      showToast("ok", "Max-Q 隐藏彩蛋已解锁！正在突破最大动压 🚀");
+    } else {
+      setLogoClicks(next);
+    }
   };
 
   const refreshAll = async () => {
     if (!inTauri) return;
     try {
-      const [list, st, pol, l, br, tunSt] = await Promise.all([
+      const [list, st, pol, l, br, tunSt, ab] = await Promise.all([
         api.listProfiles(),
         api.getRuntimeStatus(),
         api.getRuntimePolicy(),
         api.getRuntimeLogs(),
         api.getBuiltinRulesInfo(),
         api.getTunServiceStatus(),
+        api.getAboutInfo(),
       ]);
       setProfiles(list);
       setStatus(st);
@@ -200,13 +331,19 @@ export default function App() {
       setLogs(l);
       setBuiltinRules(br);
       setTunService(tunSt);
+      setAboutInfo(ab);
 
       const targetId = selectedProfileId ?? list[0]?.id ?? null;
-      if (targetId) {
+      if (targetId && list.some((p) => p.id === targetId)) {
         setSelectedProfileId(targetId);
         const full = await api.getProfile(targetId);
         setProfile(full);
+      } else if (list[0]) {
+        setSelectedProfileId(list[0].id);
+        const full = await api.getProfile(list[0].id);
+        setProfile(full);
       } else {
+        setSelectedProfileId(null);
         setProfile(null);
       }
     } catch (err) {
@@ -214,23 +351,33 @@ export default function App() {
     }
   };
 
+  // Real-time Rust polling for runtime status, logs, TUN service, and live Clash API telemetry
   useEffect(() => {
     refreshAll();
     if (!inTauri) return;
     const timer = setInterval(async () => {
       try {
-        const [st, l, tunSt] = await Promise.all([
+        const [st, l, tunSt, tel] = await Promise.all([
           api.getRuntimeStatus(),
           api.getRuntimeLogs(),
           api.getTunServiceStatus(),
+          api.getRuntimeTelemetry(),
         ]);
         setStatus(st);
         setLogs(l);
         setTunService(tunSt);
+        setTelemetry(tel);
+        setSpeedHistory((prev) => [
+          ...prev.slice(-27),
+          {
+            up: st.running ? tel.upload_bps : 0,
+            down: st.running ? tel.download_bps : 0,
+          },
+        ]);
       } catch {
-        // ignore transient polling error
+        // ignore transient poll error
       }
-    }, 2500);
+    }, 1800);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProfileId]);
@@ -261,6 +408,12 @@ export default function App() {
     });
   }, [proxyNodes, protoFilter, searchQuery]);
 
+  const filteredLogs = useMemo(() => {
+    const q = logFilter.trim().toLowerCase();
+    if (!q) return logs;
+    return logs.filter((line) => line.toLowerCase().includes(q));
+  }, [logs, logFilter]);
+
   const applyPolicyChange = async (patch: Partial<RuntimePolicy>, reconnectIfRunning = true) => {
     const nextPolicy: RuntimePolicy = { ...policy, ...patch };
     setPolicy(nextPolicy);
@@ -276,6 +429,8 @@ export default function App() {
         );
         setStatus(st);
         showToast("ok", "策略已热更新并重新应用到运行中内核");
+      } else {
+        showToast("ok", "配置策略已保存");
       }
     } catch (err) {
       showToast("err", String(err));
@@ -284,10 +439,7 @@ export default function App() {
 
   const handleSwitchProxyMode = async (mode: ProxyMode) => {
     if (mode === "tun" && inTauri && !tunService.running) {
-      showToast(
-        "info",
-        "TUN 模式需要先安装 MaxQ 安全加固 Windows 服务（点击右侧「安装 TUN 服务」按钮触发 UAC）"
-      );
+      showToast("info", "TUN 模式需要先安装 MaxQ 安全加固 Windows 服务，已为你跳转至安全中心。");
       setTab("security");
       return;
     }
@@ -303,6 +455,7 @@ export default function App() {
       const st = await api.getTunServiceStatus();
       setTunService(st);
       showToast(st.running ? "ok" : "info", msg);
+      if (st.running && soundEnabled) playSoftTone("connect");
     } catch (err) {
       const st = await api.getTunServiceStatus().catch(() => null);
       if (st) setTunService(st);
@@ -390,10 +543,8 @@ export default function App() {
         policy.proxy_mode === "system_proxy"
       );
       setStatus(st);
-      showToast(
-        "ok",
-        `已通过 ${st.tun_active ? "TUN 虚拟网卡" : "系统代理"} 连接 ${node.name}`
-      );
+      if (soundEnabled) playSoftTone("connect");
+      showToast("ok", `已通过 ${st.tun_active ? "TUN 虚拟网卡" : "系统代理"} 连接 ${node.name}`);
     } catch (err) {
       const msg = String(err);
       showToast("err", msg);
@@ -409,7 +560,29 @@ export default function App() {
     try {
       const st = await api.stopProxy();
       setStatus(st);
+      setTelemetry({
+        connected: false,
+        upload_bps: 0,
+        download_bps: 0,
+        upload_total: 0,
+        download_total: 0,
+        active_connections: 0,
+        uptime_secs: 0,
+        dynamic_pressure_q: 0,
+        recent_connections: [],
+      });
+      if (soundEnabled) playSoftTone("disconnect");
       showToast("info", "已断开连接并恢复网络设置");
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleCloseConnections = async () => {
+    if (!inTauri) return;
+    try {
+      await api.closeAllConnections();
+      showToast("ok", "已释放全部旧连接");
     } catch (err) {
       showToast("err", String(err));
     }
@@ -439,14 +612,38 @@ export default function App() {
     try {
       const ms = await api.testNodeLatency(node.id);
       setLatencies((prev) => ({ ...prev, [node.id]: ms }));
+      if (soundEnabled) playSoftTone("ping");
     } catch {
       setLatencies((prev) => ({ ...prev, [node.id]: "err" }));
     }
   };
 
-  const handleTestAllLatencies = async () => {
-    const batch = filteredNodes.slice(0, 20);
-    await Promise.all(batch.map((n) => handleTestLatency(n)));
+  const handleBatchTestLatencies = async () => {
+    if (!profile || scanningOrbit) return;
+    setScanningOrbit(true);
+    const loadingMap: Record<string, "loading"> = {};
+    for (const n of proxyNodes) loadingMap[n.id] = "loading";
+    setLatencies((prev) => ({ ...prev, ...loadingMap }));
+    try {
+      const results = await api.batchTestLatencies(profile.id);
+      const next: Record<string, number | "err"> = {};
+      let okCount = 0;
+      for (const [id, ms] of Object.entries(results)) {
+        if (typeof ms === "number") {
+          next[id] = ms;
+          okCount += 1;
+        } else {
+          next[id] = "err";
+        }
+      }
+      setLatencies((prev) => ({ ...prev, ...next }));
+      if (soundEnabled) playSoftTone("ping");
+      showToast("ok", `星轨并发测速完成：${okCount} / ${Object.keys(results).length} 个节点可达`);
+    } catch (err) {
+      showToast("err", String(err));
+    } finally {
+      setScanningOrbit(false);
+    }
   };
 
   const handleProbeNode = async (node: NodeConfig) => {
@@ -467,447 +664,800 @@ export default function App() {
   const handleConfirmPin = async () => {
     if (!inspectNode || !probeResult) return;
     try {
-      const updated = await api.confirmNodePin(inspectNode.id, probeResult.proposed_trust_record);
-      setInspectNode(updated);
+      await api.confirmNodePin(inspectNode.id, probeResult.proposed_trust_record);
+      setInspectNode(null);
+      setProbeResult(null);
       await refreshAll();
-      showToast("ok", `已固定 ${updated.name} 的公钥 SPKI 指纹`);
+      showToast("ok", `已为 ${inspectNode.name} 固定 SPKI 公钥指纹`);
     } catch (err) {
-      setProbeError(String(err));
+      showToast("err", String(err));
     }
   };
 
-  const handleToggleInsecureOverride = async (node: NodeConfig, confirmed: boolean) => {
+  const handleTemporaryOverride = async () => {
+    if (!inspectNode) return;
     try {
-      const updated = await api.setInsecureOverride(node.id, confirmed);
-      setInspectNode(updated);
+      await api.setInsecureOverride(inspectNode.id, true);
+      setInspectNode(null);
       await refreshAll();
+      showToast("info", `已临时放行 ${inspectNode.name}（建议尽快固定 SPKI 指纹）`);
     } catch (err) {
-      setProbeError(String(err));
+      showToast("err", String(err));
     }
   };
 
-  const activeRuleCountLabel =
-    policy.routing_mode === "global"
-      ? "全局代理"
-      : policy.routing_mode === "direct"
-      ? "全局直连"
-      : policy.rule_source === "builtin_default" || (profile?.rules.length ?? 0) === 0
-      ? `内置 ${builtinRules.rule_count.toLocaleString()} 条分流`
-      : `配置 ${profile?.rules.length.toLocaleString()} 条分流`;
+  const handleCommitRename = async (profileId: string) => {
+    const trimmed = renameDraft.trim();
+    setRenamingId(null);
+    if (!trimmed) return;
+    try {
+      await api.renameProfile(profileId, trimmed);
+      await refreshAll();
+      showToast("ok", `配置已重命名为「${trimmed}」`);
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleCopyDiagnostics = async () => {
+    try {
+      const text = inTauri
+        ? await api.exportDiagnosticsSummary()
+        : `MaxQ v${aboutInfo.app_version} — Powered by JaxCore sing-box · JucStudio Neon`;
+      await navigator.clipboard.writeText(text);
+      showToast("ok", "已复制脱敏诊断报告至剪贴板（零密钥泄露）");
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const navItems: Array<{ id: Tab; label: string; icon: typeof Server; badge?: string }> = [
+    { id: "nodes", label: "节点控制", icon: Server, badge: proxyNodes.length ? String(proxyNodes.length) : undefined },
+    {
+      id: "radar",
+      label: "星轨雷达",
+      icon: Radar,
+      badge: status.running && telemetry.active_connections > 0 ? String(telemetry.active_connections) : undefined,
+    },
+    { id: "security", label: "安全与规则", icon: Shield, badge: unverifiedCount > 0 ? `${unverifiedCount}` : undefined },
+    { id: "logs", label: "运行日志", icon: Terminal },
+    { id: "settings", label: "偏好与主题", icon: Settings },
+    { id: "about", label: "关于 MaxQ", icon: Info },
+  ];
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#090c10] text-slate-100">
-      {/* Left Navigation Rail */}
-      <aside className="mq-panel flex w-60 shrink-0 flex-col border-y-0 border-l-0 p-4">
-        <div className="mb-6 flex items-center gap-3 px-1.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/15 text-sky-400 ring-1 ring-sky-400/25">
-            <Shield className="h-5 w-5" />
-          </div>
-          <div>
-            <div className="text-[15px] font-semibold tracking-tight text-white">MaxQ</div>
-            <div className="font-mono-tabular text-[11px] text-slate-400">
-              v0.2 · sing-box 1.14.4
+    <div className="flex h-screen overflow-hidden" style={{ backgroundColor: "var(--mq-bg)", color: "var(--mq-ink)" }}>
+      {/* Left Brand & Navigation Rail */}
+      <aside className="mq-rail flex w-60 shrink-0 flex-col justify-between p-4">
+        <div className="space-y-4">
+          {/* Brand Header (click emblem 5x for Max-Q launch Easter egg!) */}
+          <div className="flex items-center justify-between px-1">
+            <div className="flex items-center gap-3">
+              <MaxQLogo
+                size={38}
+                interactive
+                onClick={handleLogoTap}
+                title="MaxQ — 连点 5 次触发隐藏升空彩蛋"
+              />
+              <div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[15px] font-bold tracking-tight" style={{ color: "var(--mq-ink)" }}>
+                    MaxQ
+                  </span>
+                  <span
+                    className="font-mono-tabular rounded-md px-1.5 py-0.5 text-[10px] font-semibold"
+                    style={{
+                      backgroundColor: "var(--mq-accent-soft)",
+                      color: "var(--mq-accent-ink)",
+                    }}
+                  >
+                    v{aboutInfo.app_version}
+                  </span>
+                </div>
+                <div className="text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
+                  JaxCore · sing-box
+                </div>
+              </div>
             </div>
           </div>
+
+          {/* Compact Live Power Status Card */}
+          <div
+            className="rounded-2xl border p-3 transition-colors"
+            style={{
+              backgroundColor: status.running ? "var(--mq-card)" : "var(--mq-subtle)",
+              borderColor: status.running ? "var(--mq-accent)" : "var(--mq-border)",
+            }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="relative flex h-2.5 w-2.5 shrink-0 items-center justify-center">
+                  {status.running && (
+                    <span
+                      className="mq-pulse-ring absolute inline-flex h-full w-full rounded-full"
+                      style={{ backgroundColor: "var(--mq-ok)" }}
+                    />
+                  )}
+                  <span
+                    className="relative inline-flex h-2 w-2 rounded-full"
+                    style={{ backgroundColor: status.running ? "var(--mq-ok)" : "var(--mq-ink-3)" }}
+                  />
+                </span>
+                <span className="truncate text-xs font-semibold" style={{ color: "var(--mq-ink)" }}>
+                  {status.running ? status.active_node_name || "运行中" : "内核待命"}
+                </span>
+              </div>
+              {status.running && (
+                <button
+                  onClick={handleStopProxy}
+                  title="断开连接"
+                  className="mq-btn shrink-0 rounded-lg p-1.5"
+                  style={{
+                    backgroundColor: "var(--mq-danger-bg)",
+                    color: "var(--mq-danger)",
+                  }}
+                >
+                  <Power className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            <div className="mt-1.5 flex items-center justify-between text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
+              <span>
+                {status.running
+                  ? status.tun_active
+                    ? "TUN 虚拟网卡接管"
+                    : "系统代理已启用"
+                  : "选定节点即可秒连"}
+              </span>
+              {status.running && (
+                <span className="font-mono-tabular" style={{ color: "var(--mq-accent-ink)" }}>
+                  Q {Math.round(telemetry.dynamic_pressure_q)}%
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Primary Navigation */}
+          <nav className="space-y-1">
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              const active = tab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setTab(item.id)}
+                  className="mq-nav-item flex w-full items-center justify-between rounded-xl px-3 py-2 text-[13px] font-medium"
+                  style={
+                    active
+                      ? {
+                          backgroundColor: "var(--mq-card)",
+                          color: "var(--mq-accent-ink)",
+                          border: "1px solid var(--mq-border-strong)",
+                        }
+                      : {
+                          color: "var(--mq-ink-2)",
+                          border: "1px solid transparent",
+                        }
+                  }
+                >
+                  <span className="flex items-center gap-2.5">
+                    <Icon
+                      className="h-4 w-4"
+                      style={{ color: active ? "var(--mq-accent)" : "var(--mq-ink-3)" }}
+                    />
+                    {item.label}
+                  </span>
+                  {item.badge && (
+                    <span
+                      className="font-mono-tabular rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
+                      style={{
+                        backgroundColor:
+                          item.id === "security" && unverifiedCount > 0
+                            ? "var(--mq-danger-bg)"
+                            : "var(--mq-accent-soft)",
+                        color:
+                          item.id === "security" && unverifiedCount > 0
+                            ? "var(--mq-danger)"
+                            : "var(--mq-accent-ink)",
+                      }}
+                    >
+                      {item.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
         </div>
 
-        <nav className="flex-1 space-y-1">
-          {[
-            { id: "nodes" as Tab, label: "节点与测速", icon: Server },
-            { id: "security" as Tab, label: "TUN 服务与规则", icon: ShieldCheck },
-            { id: "logs" as Tab, label: "运行日志", icon: Terminal },
-            { id: "settings" as Tab, label: "防泄漏与内核", icon: Settings },
-          ].map((item) => {
-            const Icon = item.icon;
-            const active = tab === item.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => setTab(item.id)}
-                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition ${
-                  active
-                    ? "bg-[#1a2433] text-white"
-                    : "text-slate-400 hover:bg-[#141b26] hover:text-slate-200"
-                }`}
-              >
-                <Icon className={`h-4 w-4 ${active ? "text-sky-400" : "text-slate-500"}`} />
-                {item.label}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* Bottom Runtime Status Capsule */}
-        <div className="mt-4 rounded-xl border border-slate-800/80 bg-[#0b0f16] p-3.5">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-slate-400">引擎状态</span>
-            <span
-              className={`inline-flex items-center gap-1.5 font-medium ${
-                status.running ? "text-emerald-400" : "text-slate-500"
-              }`}
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  status.running ? "bg-emerald-400" : "bg-slate-600"
-                }`}
-              />
-              {status.running
-                ? status.tun_active
-                  ? "TUN 运行中"
-                  : "系统代理中"
-                : "待机"}
-            </span>
-          </div>
-
-          <div className="mt-2 truncate text-xs font-medium text-slate-200">
-            {status.active_node_name ?? "未选择节点"}
-          </div>
-          <div className="mt-1 font-mono-tabular text-[11px] text-slate-500">
-            {activeRuleCountLabel}
-          </div>
-
-          {status.running && (
+        {/* Bottom Profile Vault Switcher */}
+        <div
+          className="space-y-2 border-t pt-3"
+          style={{ borderColor: "var(--mq-border)" }}
+        >
+          <div className="flex items-center justify-between px-1 text-[11px] font-semibold" style={{ color: "var(--mq-ink-3)" }}>
+            <span>本地配置库 ({profiles.length})</span>
             <button
-              onClick={handleStopProxy}
-              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-rose-500/12 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20"
+              onClick={() => setImportOpen(true)}
+              className="mq-btn rounded-md p-1 hover:bg-[var(--mq-card)]"
+              style={{ color: "var(--mq-accent)" }}
+              title="导入新配置"
             >
-              <Power className="h-3.5 w-3.5" /> 断开连接
+              <Plus className="h-3.5 w-3.5" />
             </button>
-          )}
+          </div>
+          <div className="max-h-32 space-y-1 overflow-y-auto pr-0.5">
+            {profiles.length === 0 ? (
+              <div className="px-2 py-2 text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
+                暂无配置，点右上角导入分享链或 `.conf`
+              </div>
+            ) : (
+              profiles.map((p) => {
+                const selected = p.id === selectedProfileId;
+                return (
+                  <div
+                    key={p.id}
+                    className="group flex items-center justify-between gap-1 rounded-xl px-2.5 py-1.5 text-xs transition-colors"
+                    style={
+                      selected
+                        ? { backgroundColor: "var(--mq-card)", color: "var(--mq-ink)" }
+                        : { color: "var(--mq-ink-2)" }
+                    }
+                  >
+                    {renamingId === p.id ? (
+                      <div className="flex w-full items-center gap-1">
+                        <input
+                          value={renameDraft}
+                          autoFocus
+                          onChange={(e) => setRenameDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") handleCommitRename(p.id);
+                            if (e.key === "Escape") setRenamingId(null);
+                          }}
+                          className="w-full rounded bg-transparent text-xs font-medium focus:outline-none"
+                          style={{ color: "var(--mq-ink)" }}
+                        />
+                        <button
+                          onClick={() => handleCommitRename(p.id)}
+                          style={{ color: "var(--mq-ok)" }}
+                        >
+                          <Check className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => setSelectedProfileId(p.id)}
+                          className="min-w-0 flex-1 truncate text-left font-medium"
+                        >
+                          {p.name}
+                        </button>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <button
+                            onClick={() => {
+                              setRenamingId(p.id);
+                              setRenameDraft(p.name);
+                            }}
+                            title="重命名配置"
+                            className="opacity-0 transition-opacity group-hover:opacity-100"
+                            style={{ color: "var(--mq-ink-3)" }}
+                          >
+                            <Edit3 className="h-3 w-3" />
+                          </button>
+                          <span className="font-mono-tabular text-[10px]" style={{ color: "var(--mq-ink-3)" }}>
+                            {p.node_count}
+                          </span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <div className="px-1 pt-0.5 text-[10px]" style={{ color: "var(--mq-ink-3)" }}>
+            by JucStudio · Neon
+          </div>
         </div>
       </aside>
 
-      {/* Main Workspace */}
-      <div className="flex flex-1 flex-col overflow-hidden">
-        {/* Global MITM Critical Alert */}
-        {status.last_mitm_alert && (
-          <div className="flex items-center gap-3 border-b border-rose-500/40 bg-rose-950/90 px-6 py-3 text-xs text-rose-100">
-            <ShieldAlert className="h-4 w-4 shrink-0 text-rose-400" />
-            <span>
-              <strong>证书公钥变更 / 疑似 MITM 告警：</strong> 检测到未受信任的远端公钥{" "}
-              <code className="font-mono-tabular rounded bg-rose-900/80 px-1.5 py-0.5">
-                {status.last_mitm_alert}
-              </code>
-            </span>
-          </div>
-        )}
-
-        {/* Toast feedback bar */}
-        {toast && (
-          <div
-            className={`flex items-center justify-between border-b px-6 py-2 text-xs ${
-              toast.kind === "err"
-                ? "border-rose-500/30 bg-rose-950/40 text-rose-200"
-                : toast.kind === "ok"
-                ? "border-emerald-500/30 bg-emerald-950/40 text-emerald-200"
-                : "border-sky-500/30 bg-sky-950/40 text-sky-200"
-            }`}
-          >
-            <span>{toast.text}</span>
-            <button onClick={() => setToast(null)} className="opacity-70 hover:opacity-100">
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
-
-        {/* Unified Top Command Deck */}
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/70 bg-[#0c1017] px-6 py-3.5">
+      {/* Main Content Workspace */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Flat Crisp Top Command Deck */}
+        <header
+          className="flex flex-wrap items-center justify-between gap-3 border-b px-6 py-3"
+          style={{ backgroundColor: "var(--mq-card)", borderColor: "var(--mq-border)" }}
+        >
           <div className="flex flex-wrap items-center gap-2.5">
-            {/* Routing Mode Segmented Switch */}
-            <div className="flex items-center rounded-lg border border-slate-800 bg-[#090c10] p-0.5 text-xs">
+            {/* Routing Mode Segmented Pill */}
+            <div className="mq-subtle flex items-center rounded-xl p-1 text-xs">
               {(
                 [
                   { id: "rule", label: "规则分流" },
-                  { id: "global", label: "全局" },
-                  { id: "direct", label: "直连" },
+                  { id: "global", label: "全局代理" },
+                  { id: "direct", label: "全部直连" },
                 ] as Array<{ id: RoutingMode; label: string }>
-              ).map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => applyPolicyChange({ routing_mode: m.id }, true)}
-                  className={`rounded-md px-2.5 py-1 font-medium transition ${
-                    policy.routing_mode === m.id
-                      ? "bg-[#1c2636] text-white"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  {m.label}
-                </button>
-              ))}
+              ).map((m) => {
+                const active = policy.routing_mode === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    onClick={() => applyPolicyChange({ routing_mode: m.id }, true)}
+                    className="mq-btn rounded-lg px-3 py-1 font-semibold"
+                    style={
+                      active
+                        ? {
+                            backgroundColor: "var(--mq-card)",
+                            color: "var(--mq-accent-ink)",
+                            border: "1px solid var(--mq-border-strong)",
+                          }
+                        : { color: "var(--mq-ink-2)", border: "1px solid transparent" }
+                    }
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
             </div>
 
-            {/* Engine Mode Segmented Switch: System Proxy vs Hardened TUN */}
-            <div className="flex items-center rounded-lg border border-slate-800 bg-[#090c10] p-0.5 text-xs">
+            {/* Proxy Engine Mode Segmented Pill */}
+            <div className="mq-subtle flex items-center rounded-xl p-1 text-xs">
               <button
                 onClick={() => handleSwitchProxyMode("system_proxy")}
-                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+                className="mq-btn flex items-center gap-1.5 rounded-lg px-3 py-1 font-semibold"
+                style={
                   policy.proxy_mode === "system_proxy"
-                    ? "bg-[#1c2636] text-white"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
+                    ? {
+                        backgroundColor: "var(--mq-card)",
+                        color: "var(--mq-accent-ink)",
+                        border: "1px solid var(--mq-border-strong)",
+                      }
+                    : { color: "var(--mq-ink-2)", border: "1px solid transparent" }
+                }
               >
                 <Globe className="h-3.5 w-3.5" /> 系统代理
               </button>
               <button
                 onClick={() => handleSwitchProxyMode("tun")}
-                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+                className="mq-btn flex items-center gap-1.5 rounded-lg px-3 py-1 font-semibold"
+                style={
                   policy.proxy_mode === "tun"
-                    ? "bg-emerald-500/20 text-emerald-300"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
+                    ? {
+                        backgroundColor: "var(--mq-ok-bg)",
+                        color: "var(--mq-ok)",
+                        border: "1px solid var(--mq-ok-border)",
+                      }
+                    : { color: "var(--mq-ink-2)", border: "1px solid transparent" }
+                }
               >
                 <Network className="h-3.5 w-3.5" /> TUN 模式
                 <span
-                  className={`h-1.5 w-1.5 rounded-full ${
-                    tunService.running ? "bg-emerald-400" : "bg-amber-400"
-                  }`}
+                  className="h-1.5 w-1.5 rounded-full"
+                  style={{ backgroundColor: tunService.running ? "var(--mq-ok)" : "var(--mq-warn)" }}
                 />
               </button>
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2">
+            {/* Quick Ctrl+K Command Palette */}
+            <button
+              onClick={() => setPaletteOpen(true)}
+              className="mq-btn mq-subtle hidden items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium sm:flex"
+              style={{ color: "var(--mq-ink-2)" }}
+              title="打开快捷指令面板 (Ctrl+K)"
+            >
+              <Command className="h-3.5 w-3.5" style={{ color: "var(--mq-accent)" }} />
+              <span>搜索</span>
+              <kbd
+                className="font-mono-tabular rounded px-1 py-0.5 text-[10px]"
+                style={{ backgroundColor: "var(--mq-card)", color: "var(--mq-ink-3)" }}
+              >
+                Ctrl K
+              </kbd>
+            </button>
+
+            {/* Quick Light / Dark Periwinkle Toggle */}
+            <button
+              onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
+              className="mq-btn mq-subtle rounded-xl p-2"
+              style={{ color: "var(--mq-accent)" }}
+              title={theme === "light" ? "切换至暮色鸢尾深色模式" : "切换至晴岚浅蓝紫浅色模式"}
+            >
+              {theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+            </button>
+
             {!tunService.running && inTauri && (
               <button
                 onClick={handleInstallTunService}
                 disabled={tunBusy}
-                className="flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#151c27] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/40 hover:text-sky-300 disabled:opacity-50"
+                className="mq-btn mq-subtle flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                style={{ color: "var(--mq-ink)" }}
               >
-                <Cpu className="h-3.5 w-3.5" />{" "}
-                {tunBusy ? "安装 TUN 服务中..." : "安装 TUN 服务 (UAC)"}
+                <Cpu className="h-3.5 w-3.5" style={{ color: "var(--mq-accent)" }} />
+                {tunBusy ? "安装中..." : "安装 TUN 服务"}
               </button>
             )}
+
             <button
               onClick={() => setImportOpen(true)}
-              className="flex items-center gap-1.5 rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400"
+              className="mq-btn mq-btn-primary flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold"
             >
               <Plus className="h-3.5 w-3.5" /> 导入节点 / 订阅
             </button>
           </div>
         </header>
 
-        {/* Main Content Viewport */}
+        {/* Scrollable Content Viewport */}
         <main className="flex-1 overflow-y-auto px-6 py-5">
-          {tab === "nodes" && (
-            <div className="mx-auto max-w-6xl space-y-4">
-              {/* Profile Selector & Metadata Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-2.5">
-                  {profiles.length > 0 && (
-                    <select
-                      value={selectedProfileId ?? ""}
-                      onChange={(e) => setSelectedProfileId(e.target.value)}
-                      className="rounded-lg border border-slate-800 bg-[#111722] px-3 py-1.5 text-xs font-medium text-slate-200 outline-none focus:border-sky-500"
-                    >
-                      {profiles.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} · {p.node_count} 节点
-                        </option>
-                      ))}
-                    </select>
-                  )}
-
-                  {metadataNodes.map((m) => (
-                    <span
-                      key={m.id}
-                      className="font-mono-tabular inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111722] px-2.5 py-1 text-[11px] text-slate-300"
-                    >
-                      <Activity className="h-3 w-3 text-sky-400" />
-                      {m.name}
-                    </span>
-                  ))}
-                </div>
-
-                {proxyNodes.length > 0 && (
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleTestAllLatencies}
-                      className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-[#111722] px-3 py-1.5 text-xs text-slate-300 hover:border-slate-700 hover:text-white"
-                    >
-                      <Gauge className="h-3.5 w-3.5" /> 批量测速
-                    </button>
-                    {unverifiedCount > 0 && (
-                      <button
-                        onClick={handleBatchProbeAndPin}
-                        disabled={batchPinning}
-                        className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-50"
-                      >
-                        <Sparkles className={`h-3.5 w-3.5 ${batchPinning ? "animate-spin" : ""}`} />
-                        {batchPinning
-                          ? "并发探测固定中..."
-                          : `一键批量探测并固定 (${unverifiedCount})`}
-                      </button>
-                    )}
-                  </div>
-                )}
+          {/* MITM Runtime Pin Mismatch Emergency Banner */}
+          {status.last_mitm_alert && (
+            <div
+              className="mq-enter mb-4 flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-xs"
+              style={{
+                backgroundColor: "var(--mq-danger-bg)",
+                borderColor: "var(--mq-danger-border)",
+                color: "var(--mq-danger)",
+              }}
+            >
+              <div className="flex items-center gap-2.5">
+                <ShieldAlert className="h-4 w-4 shrink-0" />
+                <span>
+                  <strong>安全警报（MITM 拦截）：</strong>服务端返回了未授权的 SPKI 公钥指纹{" "}
+                  <code className="font-mono-tabular font-semibold">{status.last_mitm_alert}</code>
+                  ，连接已被 JaxCore sing-box 自动拒绝！
+                </span>
               </div>
+              <button
+                onClick={() => setTab("logs")}
+                className="mq-btn shrink-0 rounded-lg px-2.5 py-1 font-semibold text-white"
+                style={{ backgroundColor: "var(--mq-danger)" }}
+              >
+                查看日志
+              </button>
+            </div>
+          )}
 
-              {/* Search & Protocol Filters */}
-              {proxyNodes.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="relative w-64">
-                    <Search className="pointer-events-none absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500" />
-                    <input
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="搜索节点名 / 域名 / SNI..."
-                      className="w-full rounded-lg border border-slate-800 bg-[#111722] py-1.5 pl-8 pr-3 text-xs text-slate-200 placeholder:text-slate-500 outline-none focus:border-sky-500"
-                    />
-                  </div>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {PROTOCOL_FILTERS.map((f) => (
-                      <button
-                        key={f.id}
-                        onClick={() => setProtoFilter(f.id)}
-                        className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition ${
-                          protoFilter === f.id
-                            ? "bg-sky-500/20 text-sky-300"
-                            : "bg-[#111722] text-slate-400 hover:text-slate-200"
-                        }`}
-                      >
-                        {f.label}
-                      </button>
-                    ))}
-                  </div>
+          {/* Toast Feedback Banner */}
+          {toast && (
+            <div
+              className="mq-enter mb-4 flex items-center justify-between gap-3 rounded-2xl border px-4 py-2.5 text-xs font-medium"
+              style={
+                toast.kind === "err"
+                  ? {
+                      backgroundColor: "var(--mq-danger-bg)",
+                      borderColor: "var(--mq-danger-border)",
+                      color: "var(--mq-danger)",
+                    }
+                  : toast.kind === "ok"
+                  ? {
+                      backgroundColor: "var(--mq-ok-bg)",
+                      borderColor: "var(--mq-ok-border)",
+                      color: "var(--mq-ok)",
+                    }
+                  : {
+                      backgroundColor: "var(--mq-accent-soft)",
+                      borderColor: "var(--mq-border-strong)",
+                      color: "var(--mq-accent-ink)",
+                    }
+              }
+            >
+              <span className="break-all">{toast.text}</span>
+              <button onClick={() => setToast(null)} className="shrink-0 opacity-70 hover:opacity-100">
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
+          {/* TAB 1: NODES COMMAND DECK */}
+          {tab === "nodes" && (
+            <div className="mx-auto max-w-6xl space-y-5">
+              {/* Live Max-Q Aerodynamic Telemetry Strip */}
+              <TelemetryRibbon
+                connected={status.running}
+                activeNodeName={status.active_node_name}
+                tunActive={status.tun_active}
+                telemetry={telemetry}
+                history={speedHistory}
+                onCloseConnections={handleCloseConnections}
+              />
+
+              {/* Metadata Info Chips (Traffic / Expire) */}
+              {metadataNodes.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {metadataNodes.map((m) => (
+                    <div
+                      key={m.id}
+                      className="mq-panel flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium"
+                      style={{ color: "var(--mq-ink-2)" }}
+                    >
+                      <Activity className="h-3 w-3" style={{ color: "var(--mq-accent)" }} />
+                      {m.name}
+                    </div>
+                  ))}
                 </div>
               )}
 
-              {/* Nodes Grid */}
-              {filteredNodes.length === 0 ? (
-                <div className="mq-panel flex flex-col items-center justify-center rounded-2xl border-dashed py-20 text-center">
-                  <Shield className="mb-3 h-9 w-9 text-slate-600" />
-                  <p className="text-sm font-medium text-slate-200">
-                    {proxyNodes.length === 0 ? "尚未导入任何节点" : "没有匹配的筛选节点"}
+              {!profile ? (
+                <div className="mq-panel mq-enter flex flex-col items-center justify-center rounded-3xl px-6 py-16 text-center">
+                  <div className="mq-float mb-4">
+                    <MaxQLogo size={64} interactive onClick={triggerLaunch} />
+                  </div>
+                  <h2 className="text-lg font-bold tracking-tight" style={{ color: "var(--mq-ink)" }}>
+                    欢迎登舰 MaxQ
+                  </h2>
+                  <p className="mt-2 max-w-md text-xs leading-relaxed" style={{ color: "var(--mq-ink-2)" }}>
+                    支持 Shadowrocket 单条分享链（`trojan://` / `vless://` / `anytls://` / `hy2://` / `tuic://`）、
+                    完整 `.conf` 以及 HTTPS 订阅导入。单节点开箱自带{" "}
+                    <strong style={{ color: "var(--mq-accent-ink)" }}>
+                      {builtinRules.rule_count.toLocaleString()} 条脱敏默认分流规则
+                    </strong>
+                    ，并采用 Scheme A 默认安全防中间人策略。
                   </p>
-                  <p className="mt-1.5 max-w-md text-xs text-slate-500">
-                    导入单条 Shadowrocket 链接（trojan / anytls / hy2 / tuic / vless / vmess / ss）即可自动启用内置{" "}
-                    {builtinRules.rule_count.toLocaleString()} 条默认分流规则，无需手写规则文件。
-                  </p>
-                  <button
-                    onClick={() => setImportOpen(true)}
-                    className="mt-5 rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400"
-                  >
-                    立即导入并审计
-                  </button>
+                  <div className="mt-6 flex flex-wrap justify-center gap-2.5">
+                    <button
+                      onClick={() => setImportOpen(true)}
+                      className="mq-btn mq-btn-primary flex items-center gap-1.5 rounded-xl px-5 py-2.5 text-xs font-semibold"
+                    >
+                      <Plus className="h-4 w-4" /> 导入第一个节点 / 订阅
+                    </button>
+                    <button
+                      onClick={() => setTab("about")}
+                      className="mq-btn mq-subtle flex items-center gap-1.5 rounded-xl px-4 py-2.5 text-xs font-medium"
+                      style={{ color: "var(--mq-ink-2)" }}
+                    >
+                      <Sparkles className="h-3.5 w-3.5" style={{ color: "var(--mq-accent)" }} /> 了解 MaxQ 品牌与特性
+                    </button>
+                  </div>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                  {filteredNodes.map((node) => {
-                    const badge = tlsBadge(node);
-                    const BadgeIcon = badge.icon;
-                    const isActive = status.running && status.active_node_id === node.id;
-                    const lat = latencies[node.id];
+                <>
+                  {/* Filter & Batch Action Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="relative">
+                        <Search
+                          className="pointer-events-none absolute left-3 top-2.5 h-3.5 w-3.5"
+                          style={{ color: "var(--mq-ink-3)" }}
+                        />
+                        <input
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          placeholder="搜索节点名、主机或 SNI..."
+                          className="mq-panel w-56 rounded-xl py-1.5 pl-8 pr-3 text-xs focus:outline-none"
+                          style={{ color: "var(--mq-ink)" }}
+                        />
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {PROTOCOL_FILTERS.map((pf) => {
+                          const active = protoFilter === pf.id;
+                          return (
+                            <button
+                              key={pf.id}
+                              onClick={() => setProtoFilter(pf.id)}
+                              className="mq-btn rounded-lg px-2.5 py-1 text-xs font-medium"
+                              style={
+                                active
+                                  ? {
+                                      backgroundColor: "var(--mq-accent-soft)",
+                                      color: "var(--mq-accent-ink)",
+                                    }
+                                  : { color: "var(--mq-ink-2)" }
+                              }
+                            >
+                              {pf.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
 
-                    return (
-                      <div
-                        key={node.id}
-                        className={`mq-card flex flex-col justify-between rounded-xl p-4 ${
-                          isActive ? "!border-emerald-500/45 !bg-emerald-950/15" : ""
-                        }`}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleBatchTestLatencies}
+                        disabled={scanningOrbit || proxyNodes.length === 0}
+                        className="mq-btn mq-panel flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                        style={{ color: "var(--mq-ink)" }}
                       >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span className="rounded bg-[#0d121a] px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wide text-sky-400">
-                                {protocolLabel(node.protocol.type)}
-                              </span>
-                              <h3 className="truncate text-[13px] font-semibold text-white">
-                                {node.name}
-                              </h3>
+                        <Gauge
+                          className={`h-3.5 w-3.5 ${scanningOrbit ? "animate-spin" : ""}`}
+                          style={{ color: "var(--mq-accent)" }}
+                        />
+                        {scanningOrbit ? "并发测速中..." : "一键测速"}
+                      </button>
+                      {unverifiedCount > 0 && (
+                        <button
+                          onClick={handleBatchProbeAndPin}
+                          disabled={batchPinning}
+                          className="mq-btn mq-btn-primary flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                        >
+                          <Sparkles className={`h-3.5 w-3.5 ${batchPinning ? "animate-spin" : ""}`} />
+                          {batchPinning ? "批量固定中..." : `一键固定 ${unverifiedCount} 个待验证节点`}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Clean Flat Node Cards Grid */}
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {filteredNodes.map((node) => {
+                      const badge = tlsBadge(node);
+                      const BadgeIcon = badge.icon;
+                      const isActive = status.running && status.active_node_id === node.id;
+                      const lat = latencies[node.id];
+                      const spki = node.tls.trust_record?.spki_sha256_b64;
+
+                      return (
+                        <div
+                          key={node.id}
+                          className={`flex flex-col justify-between gap-3 rounded-2xl p-4 ${
+                            isActive ? "mq-card-active" : "mq-card"
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex min-w-0 items-start gap-3">
+                              {spki ? (
+                                <SpkiSigil
+                                  seed={spki}
+                                  size={34}
+                                  className="mt-0.5 border border-[var(--mq-border)]"
+                                />
+                              ) : (
+                                <div
+                                  className="mt-0.5 flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg text-[11px] font-bold"
+                                  style={{
+                                    backgroundColor: "var(--mq-subtle)",
+                                    color: "var(--mq-accent)",
+                                    border: "1px solid var(--mq-border)",
+                                  }}
+                                >
+                                  {protocolLabel(node.protocol.type).slice(0, 2)}
+                                </div>
+                              )}
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span
+                                    className="truncate text-sm font-semibold"
+                                    style={{ color: "var(--mq-ink)" }}
+                                  >
+                                    {node.name}
+                                  </span>
+                                  <span
+                                    className="rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase"
+                                    style={{
+                                      backgroundColor: "var(--mq-subtle)",
+                                      color: "var(--mq-ink-2)",
+                                    }}
+                                  >
+                                    {protocolLabel(node.protocol.type)}
+                                  </span>
+                                </div>
+                                <div
+                                  className="font-mono-tabular mt-1 truncate text-[11px]"
+                                  style={{ color: "var(--mq-ink-3)" }}
+                                >
+                                  {node.dial_override_server
+                                    ? `${node.dial_override_server} (${node.server})`
+                                    : node.server}
+                                  :{node.server_port}
+                                  {node.tls.server_name ? ` · SNI ${node.tls.server_name}` : ""}
+                                </div>
+                              </div>
                             </div>
-                            <div className="font-mono-tabular mt-1.5 truncate text-[11px] text-slate-400">
-                              {node.dial_override_server ?? node.server}:{node.server_port}
-                              {node.tls.server_name && (
-                                <span className="ml-2 text-slate-500">
-                                  · {node.tls.server_name}
-                                </span>
+
+                            {/* Latency Badge */}
+                            <button
+                              onClick={() => handleTestLatency(node)}
+                              title="测试 TCP 握手延迟"
+                              className="font-mono-tabular mq-btn shrink-0 rounded-lg px-2 py-1 text-[11px] font-semibold"
+                              style={{
+                                backgroundColor: "var(--mq-subtle)",
+                                color:
+                                  lat === "err"
+                                    ? "var(--mq-danger)"
+                                    : typeof lat === "number"
+                                    ? lat < 100
+                                      ? "var(--mq-ok)"
+                                      : lat < 220
+                                      ? "var(--mq-accent-ink)"
+                                      : "var(--mq-warn)"
+                                    : "var(--mq-ink-3)",
+                              }}
+                            >
+                              {lat === "loading"
+                                ? "..."
+                                : lat === "err"
+                                ? "超时"
+                                : typeof lat === "number"
+                                ? `${lat} ms`
+                                : "测速"}
+                            </button>
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2 pt-1">
+                            <span
+                              className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-semibold"
+                              style={{ backgroundColor: badge.bg, color: badge.color }}
+                            >
+                              <BadgeIcon className="h-3 w-3" /> {badge.label}
+                            </span>
+
+                            <div className="flex items-center gap-1.5">
+                              {node.tls.enabled && (
+                                <button
+                                  onClick={() => handleProbeNode(node)}
+                                  className="mq-btn mq-subtle rounded-lg px-2.5 py-1.5 text-xs font-medium"
+                                  style={{ color: "var(--mq-ink-2)" }}
+                                >
+                                  证书探测
+                                </button>
+                              )}
+                              {isActive ? (
+                                <button
+                                  onClick={handleStopProxy}
+                                  className="mq-btn rounded-lg px-3.5 py-1.5 text-xs font-semibold"
+                                  style={{
+                                    backgroundColor: "var(--mq-danger-bg)",
+                                    color: "var(--mq-danger)",
+                                  }}
+                                >
+                                  断开
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => handleStartNode(node)}
+                                  className="mq-btn mq-btn-primary rounded-lg px-3.5 py-1.5 text-xs font-semibold"
+                                >
+                                  连接
+                                </button>
                               )}
                             </div>
                           </div>
-
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            {lat !== undefined && (
-                              <span
-                                className={`font-mono-tabular rounded-md px-2 py-0.5 text-[11px] ${
-                                  lat === "loading"
-                                    ? "bg-slate-800 text-slate-400"
-                                    : lat === "err"
-                                    ? "bg-rose-500/15 text-rose-300"
-                                    : lat < 120
-                                    ? "bg-emerald-500/15 text-emerald-300"
-                                    : "bg-amber-500/15 text-amber-300"
-                                }`}
-                              >
-                                {lat === "loading"
-                                  ? "..."
-                                  : lat === "err"
-                                  ? "超时"
-                                  : `${lat} ms`}
-                              </span>
-                            )}
-                            <span
-                              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium ${badge.cls}`}
-                            >
-                              <BadgeIcon className="h-3 w-3" />
-                              {badge.label}
-                            </span>
-                          </div>
                         </div>
-
-                        <div className="mt-4 flex items-center justify-end gap-2">
-                          <button
-                            onClick={() => handleTestLatency(node)}
-                            className="rounded-lg bg-[#0d121a] px-2.5 py-1.5 text-[11px] text-slate-400 hover:text-slate-200"
-                          >
-                            测速
-                          </button>
-                          {node.tls.enabled && (
-                            <button
-                              onClick={() => handleProbeNode(node)}
-                              className="flex items-center gap-1 rounded-lg bg-[#0d121a] px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-slate-800"
-                            >
-                              <KeyRound className="h-3 w-3 text-sky-400" /> 探测固定
-                            </button>
-                          )}
-                          <button
-                            onClick={() => (isActive ? handleStopProxy() : handleStartNode(node))}
-                            className={`flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                              isActive
-                                ? "bg-rose-500/20 text-rose-300 hover:bg-rose-500/30"
-                                : "bg-sky-500/15 text-sky-300 hover:bg-sky-500/25"
-                            }`}
-                          >
-                            <Power className="h-3.5 w-3.5" />
-                            {isActive ? "断开" : "连接"}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                </>
               )}
             </div>
           )}
 
+          {/* TAB 2: ORBITAL RADAR & LIVE CONNECTIONS */}
+          {tab === "radar" && (
+            <OrbitalRadar
+              nodes={proxyNodes}
+              latencies={latencies}
+              activeNodeId={status.running ? status.active_node_id : undefined}
+              scanning={scanningOrbit}
+              connections={telemetry.recent_connections}
+              connected={status.running}
+              onScanAll={handleBatchTestLatencies}
+              onSelectNode={handleStartNode}
+              onCloseConnections={handleCloseConnections}
+            />
+          )}
+
+          {/* TAB 3: SECURITY, TUN SERVICE & RULES */}
           {tab === "security" && (
-            <div className="mx-auto max-w-4xl space-y-5">
-              {/* Hardened Windows TUN Service Card */}
-              <section className="mq-panel rounded-xl p-5">
+            <div className="mq-enter mx-auto max-w-5xl space-y-5">
+              {/* Hardened Windows TUN Service Control Card */}
+              <section className="mq-panel rounded-2xl p-5">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
-                    <div className="flex items-center gap-2">
-                      <Network className="h-4 w-4 text-sky-400" />
-                      <h2 className="text-sm font-semibold text-white">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Network className="h-4 w-4" style={{ color: "var(--mq-accent)" }} />
+                      <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
                         Windows 安全加固 TUN 虚拟网卡服务（防 LPE 架构）
                       </h2>
                       <span
-                        className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                        className="rounded-full px-2.5 py-0.5 text-[11px] font-semibold"
+                        style={
                           tunService.running
-                            ? "bg-emerald-500/15 text-emerald-300"
+                            ? { backgroundColor: "var(--mq-ok-bg)", color: "var(--mq-ok)" }
                             : tunService.installed
-                            ? "bg-amber-500/15 text-amber-300"
-                            : "bg-slate-800 text-slate-400"
-                        }`}
+                            ? { backgroundColor: "var(--mq-warn-bg)", color: "var(--mq-warn)" }
+                            : { backgroundColor: "var(--mq-subtle)", color: "var(--mq-ink-3)" }
+                        }
                       >
                         {tunService.running
                           ? "服务运行中"
@@ -916,9 +1466,9 @@ export default function App() {
                           : "未安装"}
                       </span>
                     </div>
-                    <p className="mt-1.5 text-xs text-slate-400">
-                      GUI 始终以普通用户运行；仅 TUN 服务按需提权。采用 SDDL DACL 锁定 Named Pipe、调用方进程路径白名单校验、
-                      `sing-box.exe` 硬编码路径与 SHA-256 完整性核验、以及 SYSTEM 独占运行目录防 `wintun.dll` 劫持。
+                    <p className="mt-1.5 text-xs leading-relaxed" style={{ color: "var(--mq-ink-2)" }}>
+                      GUI 始终以普通用户运行；仅 TUN 服务按需提权。采用显式最小权限 Named Pipe SDDL、调用方进程路径白名单校验、
+                      `sing-box.exe` 硬编码 SHA-256 核验、全重叠 I/O 超时保护以及 SYSTEM 独占运行目录防 `wintun.dll` 劫持。
                     </p>
                   </div>
 
@@ -926,15 +1476,16 @@ export default function App() {
                     <button
                       onClick={async () => setTunService(await api.getTunServiceStatus())}
                       disabled={tunBusy}
-                      className="rounded-lg border border-slate-700 bg-[#151c27] px-3 py-1.5 text-xs text-slate-300 hover:text-white disabled:opacity-50"
+                      className="mq-btn mq-subtle rounded-xl px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                      style={{ color: "var(--mq-ink-2)" }}
                     >
-                      刷新
+                      <RefreshCw className="h-3.5 w-3.5" />
                     </button>
                     {!tunService.running ? (
                       <button
                         onClick={handleInstallTunService}
                         disabled={tunBusy}
-                        className="rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
+                        className="mq-btn mq-btn-primary rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
                       >
                         {tunBusy
                           ? "安装/启动中（等待 UAC）..."
@@ -946,7 +1497,8 @@ export default function App() {
                       <button
                         onClick={handleUninstallTunService}
                         disabled={tunBusy}
-                        className="rounded-lg bg-rose-500/15 px-3.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25 disabled:opacity-50"
+                        className="mq-btn rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                        style={{ backgroundColor: "var(--mq-danger-bg)", color: "var(--mq-danger)" }}
                       >
                         {tunBusy ? "卸载中..." : "卸载 TUN 服务 (UAC)"}
                       </button>
@@ -955,24 +1507,23 @@ export default function App() {
                 </div>
 
                 {tunService.last_error && !tunService.running && (
-                  <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-200">
-                    <span className="font-semibold text-amber-300">TUN 服务诊断：</span>
+                  <div
+                    className="mt-3 rounded-xl border px-3.5 py-2.5 text-xs"
+                    style={{
+                      backgroundColor: "var(--mq-warn-bg)",
+                      borderColor: "var(--mq-warn-border)",
+                      color: "var(--mq-warn)",
+                    }}
+                  >
+                    <span className="font-semibold">TUN 服务诊断：</span>
                     <span className="font-mono-tabular break-all">{tunService.last_error}</span>
                   </div>
                 )}
 
                 <div className="mt-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
                   {[
-                    {
-                      label: "Named Pipe ACL",
-                      val: "SDDL + 禁远程",
-                      ok: true,
-                    },
-                    {
-                      label: "调用方进程校验",
-                      val: "安装目录白名单",
-                      ok: true,
-                    },
+                    { label: "Named Pipe ACL", val: "SDDL + 禁远程", ok: true },
+                    { label: "调用方进程校验", val: "安装目录白名单", ok: true },
                     {
                       label: "sing-box SHA-256",
                       val: tunService.running
@@ -982,21 +1533,15 @@ export default function App() {
                         : "启动前强制核验",
                       ok: !tunService.running || tunService.singbox_sha256_verified,
                     },
-                    {
-                      label: "wintun 防劫持",
-                      val: "SYSTEM 独占目录",
-                      ok: true,
-                    },
+                    { label: "wintun 防劫持", val: "SYSTEM 独占目录", ok: true },
                   ].map((item) => (
-                    <div
-                      key={item.label}
-                      className="rounded-lg border border-slate-800/80 bg-[#0b0f16] px-3 py-2.5"
-                    >
-                      <div className="text-[11px] text-slate-500">{item.label}</div>
+                    <div key={item.label} className="mq-subtle rounded-xl px-3.5 py-2.5">
+                      <div className="text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
+                        {item.label}
+                      </div>
                       <div
-                        className={`mt-1 font-medium ${
-                          item.ok ? "text-emerald-300" : "text-rose-300"
-                        }`}
+                        className="mt-1 font-semibold"
+                        style={{ color: item.ok ? "var(--mq-ok)" : "var(--mq-danger)" }}
                       >
                         {item.val}
                       </div>
@@ -1006,13 +1551,13 @@ export default function App() {
               </section>
 
               {/* Built-in Default Rules Engine Card */}
-              <section className="mq-panel rounded-xl p-5">
+              <section className="mq-panel rounded-2xl p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-sm font-semibold text-white">
+                    <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
                       默认内置分流规则库（{builtinRules.rule_count.toLocaleString()} 条规则）
                     </h2>
-                    <p className="mt-1 text-xs text-slate-400">
+                    <p className="mt-1 text-xs" style={{ color: "var(--mq-ink-2)" }}>
                       {builtinRules.description}。导入单条分享链时自动生效，国内流量直连、海外走代理。
                     </p>
                   </div>
@@ -1025,26 +1570,25 @@ export default function App() {
                         true
                       )
                     }
-                    className="rounded-lg border border-slate-700 bg-[#0b0f16] px-3 py-1.5 text-xs text-slate-200"
+                    className="mq-subtle rounded-xl px-3 py-2 text-xs font-medium focus:outline-none"
+                    style={{ color: "var(--mq-ink)" }}
                   >
                     <option value="profile_or_builtin">
                       优先使用导入 .conf 规则（无规则时自动用内置规则）
                     </option>
-                    <option value="builtin_default">
-                      始终强制使用 MaxQ 内置默认规则
-                    </option>
+                    <option value="builtin_default">始终强制使用 MaxQ 内置默认规则</option>
                   </select>
                 </div>
               </section>
 
               {/* Quarantined [Host] Audit Card */}
-              <section className="mq-panel rounded-xl p-5">
-                <div className="flex items-center justify-between">
+              <section className="mq-panel rounded-2xl p-5">
+                <div className="flex items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-sm font-semibold text-white">
+                    <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
                       `[Host]` 域名映射隔离审计（默认全禁用）
                     </h2>
-                    <p className="mt-1 text-xs text-slate-400">
+                    <p className="mt-1 text-xs" style={{ color: "var(--mq-ink-2)" }}>
                       仅放行确认为节点入口别名的 `proxy_endpoint_alias`；第三方域名覆盖默认阻断以防劫持。
                     </p>
                   </div>
@@ -1055,7 +1599,8 @@ export default function App() {
                         setSelectedProfileId(null);
                         await refreshAll();
                       }}
-                      className="flex items-center gap-1 rounded-lg bg-rose-500/15 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/25"
+                      className="mq-btn flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold"
+                      style={{ backgroundColor: "var(--mq-danger-bg)", color: "var(--mq-danger)" }}
                     >
                       <Trash2 className="h-3.5 w-3.5" /> 删除当前配置
                     </button>
@@ -1064,25 +1609,28 @@ export default function App() {
 
                 <div className="mt-4 space-y-2">
                   {(profile?.hosts ?? []).length === 0 ? (
-                    <div className="text-xs text-slate-500">当前配置无 `[Host]` 映射条目。</div>
+                    <div className="text-xs" style={{ color: "var(--mq-ink-3)" }}>
+                      当前配置无 `[Host]` 映射条目。
+                    </div>
                   ) : (
                     profile!.hosts.map((h, idx) => (
                       <div
                         key={`${h.domain}-${idx}`}
-                        className="flex items-center justify-between rounded-lg border border-slate-800/80 bg-[#0b0f16] px-3.5 py-2.5 text-xs"
+                        className="mq-subtle flex items-center justify-between rounded-xl px-3.5 py-2.5 text-xs"
                       >
                         <div>
-                          <span className="font-mono-tabular text-slate-200">
+                          <span className="font-mono-tabular font-medium" style={{ color: "var(--mq-ink)" }}>
                             {h.domain} → {h.target}
                           </span>
                           <span
-                            className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                            className="ml-2 rounded-md px-1.5 py-0.5 text-[10px] font-semibold"
+                            style={
                               h.classification === "proxy_endpoint_alias"
-                                ? "bg-amber-500/15 text-amber-300"
+                                ? { backgroundColor: "var(--mq-warn-bg)", color: "var(--mq-warn)" }
                                 : h.classification === "local_domain"
-                                ? "bg-slate-800 text-slate-300"
-                                : "bg-rose-500/15 text-rose-300"
-                            }`}
+                                ? { backgroundColor: "var(--mq-card)", color: "var(--mq-ink-2)" }
+                                : { backgroundColor: "var(--mq-danger-bg)", color: "var(--mq-danger)" }
+                            }
                           >
                             {h.classification === "proxy_endpoint_alias"
                               ? "代理节点别名"
@@ -1101,7 +1649,7 @@ export default function App() {
                             const next = await api.updateProfileHosts(profile!.id, updated);
                             setProfile(next);
                           }}
-                          className="h-4 w-4 accent-sky-500"
+                          className="h-4 w-4 accent-[var(--mq-accent)]"
                         />
                       </div>
                     ))
@@ -1111,442 +1659,325 @@ export default function App() {
             </div>
           )}
 
+          {/* TAB 4: LIVE KERNEL LOGS */}
           {tab === "logs" && (
-            <div className="mx-auto max-w-6xl rounded-xl border border-slate-800 bg-[#0b0f16] p-4 font-mono-tabular text-xs text-slate-300">
-              {logs.length === 0 ? (
-                <div className="py-12 text-center text-slate-500">
-                  暂无运行日志（连接节点后自动流式输出，敏感口令自动脱敏）。
+            <div className="mq-enter mx-auto max-w-6xl space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="relative">
+                  <Search
+                    className="pointer-events-none absolute left-3 top-2.5 h-3.5 w-3.5"
+                    style={{ color: "var(--mq-ink-3)" }}
+                  />
+                  <input
+                    value={logFilter}
+                    onChange={(e) => setLogFilter(e.target.value)}
+                    placeholder="过滤日志关键词（如 error / dns / public key）..."
+                    className="mq-panel w-72 rounded-xl py-1.5 pl-8 pr-3 text-xs focus:outline-none"
+                    style={{ color: "var(--mq-ink)" }}
+                  />
                 </div>
-              ) : (
-                logs.map((line, i) => (
-                  <div
-                    key={i}
-                    className={`border-b border-slate-900/80 py-1 ${
-                      line.includes("unrecognized remote public key")
-                        ? "bg-rose-950/60 text-rose-300"
-                        : ""
-                    }`}
-                  >
-                    {line}
+                <button
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(filteredLogs.join("\n"));
+                    showToast("ok", `已复制 ${filteredLogs.length} 行脱敏日志`);
+                  }}
+                  className="mq-btn mq-panel flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium"
+                  style={{ color: "var(--mq-ink-2)" }}
+                >
+                  <Copy className="h-3.5 w-3.5" /> 复制日志
+                </button>
+              </div>
+
+              <div
+                className="font-mono-tabular rounded-2xl border p-4 text-xs"
+                style={{
+                  backgroundColor: "var(--mq-log-bg)",
+                  borderColor: "var(--mq-border)",
+                  color: "var(--mq-log-ink)",
+                  minHeight: 420,
+                }}
+              >
+                {filteredLogs.length === 0 ? (
+                  <div className="py-16 text-center opacity-60">
+                    暂无运行日志（连接节点后自动流式输出，敏感口令自动脱敏）。
                   </div>
-                ))
-              )}
+                ) : (
+                  filteredLogs.map((line, i) => (
+                    <div
+                      key={i}
+                      className="border-b border-white/5 py-1.5 break-all"
+                      style={
+                        line.includes("unrecognized remote public key") || line.includes("FATAL")
+                          ? { backgroundColor: "rgba(225, 29, 72, 0.25)", color: "#fda4af" }
+                          : line.includes("ERROR")
+                          ? { color: "#fca5a5" }
+                          : undefined
+                      }
+                    >
+                      {line}
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           )}
 
+          {/* TAB 5: PREFERENCES, THEME & NETWORK POLICY */}
           {tab === "settings" && (
-            <div className="mq-panel mx-auto max-w-2xl space-y-5 rounded-xl p-6">
-              <div>
-                <h2 className="text-sm font-semibold text-white">直连防泄漏与本地端口策略</h2>
-                <p className="mt-1 text-xs text-slate-400">
-                  外部 `.conf` 与订阅无法覆盖以下任何安全边界设置。
-                </p>
-              </div>
+            <div className="mq-enter mx-auto max-w-3xl space-y-5">
+              {/* Theme & Aesthetic Customization */}
+              <section className="mq-panel space-y-4 rounded-2xl p-6">
+                <div className="flex items-center gap-2">
+                  <Palette className="h-4 w-4" style={{ color: "var(--mq-accent)" }} />
+                  <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
+                    外观定制 · 扁平灵动浅蓝紫主题
+                  </h2>
+                </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs text-slate-400">Mixed 代理端口 (127.0.0.1)</label>
-                  <input
-                    type="number"
-                    value={policy.mixed_listen_port}
-                    onChange={(e) =>
-                      setPolicy({ ...policy, mixed_listen_port: Number(e.target.value) })
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <button
+                    onClick={() => setTheme("light")}
+                    className="mq-btn flex items-center justify-between rounded-xl border p-3.5 text-left"
+                    style={
+                      theme === "light"
+                        ? { backgroundColor: "var(--mq-accent-soft)", borderColor: "var(--mq-accent)" }
+                        : { backgroundColor: "var(--mq-subtle)", borderColor: "var(--mq-border)" }
                     }
-                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-slate-400">Clash API 端口 (随机 32B Bearer)</label>
-                  <input
-                    type="number"
-                    value={policy.clash_api_port}
-                    onChange={(e) =>
-                      setPolicy({ ...policy, clash_api_port: Number(e.target.value) })
+                  >
+                    <div>
+                      <div className="text-xs font-bold" style={{ color: "var(--mq-ink)" }}>
+                        晴岚蓝紫 · Light（推荐）
+                      </div>
+                      <div className="mt-0.5 text-[11px]" style={{ color: "var(--mq-ink-2)" }}>
+                        清透瓷白 + 柔雾浅蓝紫，清爽灵动
+                      </div>
+                    </div>
+                    <Sun className="h-4 w-4" style={{ color: "var(--mq-accent)" }} />
+                  </button>
+
+                  <button
+                    onClick={() => setTheme("dark")}
+                    className="mq-btn flex items-center justify-between rounded-xl border p-3.5 text-left"
+                    style={
+                      theme === "dark"
+                        ? { backgroundColor: "var(--mq-accent-soft)", borderColor: "var(--mq-accent)" }
+                        : { backgroundColor: "var(--mq-subtle)", borderColor: "var(--mq-border)" }
                     }
-                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                  />
+                  >
+                    <div>
+                      <div className="text-xs font-bold" style={{ color: "var(--mq-ink)" }}>
+                        暮色鸢尾 · Twilight
+                      </div>
+                      <div className="mt-0.5 text-[11px]" style={{ color: "var(--mq-ink-2)" }}>
+                        柔和靛蓝夜色，夜间低眩光护眼
+                      </div>
+                    </div>
+                    <Moon className="h-4 w-4" style={{ color: "var(--mq-accent-2)" }} />
+                  </button>
                 </div>
-              </div>
 
-              <div>
-                <label className="text-xs text-slate-400">IPv6 防旁路泄漏策略</label>
-                <select
-                  value={policy.ipv6_mode}
-                  onChange={(e) =>
-                    setPolicy({
-                      ...policy,
-                      ipv6_mode: e.target.value as RuntimePolicy["ipv6_mode"],
-                    })
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                >
-                  <option value="block_to_prevent_leak">
-                    屏蔽 IPv6 / AAAA 防泄漏（推荐：IPv4 直连节点零旁路）
-                  </option>
-                  <option value="prefer_ipv4">优先 IPv4，允许双栈代理</option>
-                  <option value="dual_stack">完整双栈 IPv4 + IPv6</option>
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-xs text-slate-400">远端 DoH DNS（强制 detour=proxy）</label>
-                  <input
-                    value={policy.remote_dns_server}
-                    onChange={(e) => setPolicy({ ...policy, remote_dns_server: e.target.value })}
-                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                  />
+                  <div className="mb-2 text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                    主色氛围调色盘
+                  </div>
+                  <div className="grid grid-cols-3 gap-2.5">
+                    {(
+                      [
+                        { id: "periwinkle", name: "晴岚蓝紫", c1: "#6B7CFF", c2: "#9281FF" },
+                        { id: "glacier", name: "冰川雾蓝", c1: "#5588FF", c2: "#769EFF" },
+                        { id: "lilac", name: "丁香浅紫", c1: "#8574FF", c2: "#A98BFF" },
+                      ] as Array<{ id: AccentFlavor; name: string; c1: string; c2: string }>
+                    ).map((fl) => (
+                      <button
+                        key={fl.id}
+                        onClick={() => setAccent(fl.id)}
+                        className="mq-btn flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-xs font-semibold"
+                        style={
+                          accent === fl.id
+                            ? {
+                                backgroundColor: "var(--mq-accent-soft)",
+                                borderColor: "var(--mq-accent)",
+                                color: "var(--mq-accent-ink)",
+                              }
+                            : {
+                                backgroundColor: "var(--mq-subtle)",
+                                borderColor: "var(--mq-border)",
+                                color: "var(--mq-ink-2)",
+                              }
+                        }
+                      >
+                        <span
+                          className="h-4 w-4 rounded-full"
+                          style={{ background: `linear-gradient(135deg, ${fl.c1}, ${fl.c2})` }}
+                        />
+                        {fl.name}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">直连 / Bootstrap DNS</label>
-                  <input
-                    value={policy.direct_dns_server}
-                    onChange={(e) => setPolicy({ ...policy, direct_dns_server: e.target.value })}
-                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                  />
-                </div>
-              </div>
+              </section>
 
-              <div className="flex justify-end pt-2">
-                <button
-                  onClick={() => applyPolicyChange({}, true)}
-                  className="rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400"
-                >
-                  保存并应用策略
-                </button>
-              </div>
+              {/* Direct Anti-Leak & Ports */}
+              <section className="mq-panel space-y-5 rounded-2xl p-6">
+                <div>
+                  <h2 className="text-sm font-semibold" style={{ color: "var(--mq-ink)" }}>
+                    直连防泄漏与本地端口策略
+                  </h2>
+                  <p className="mt-1 text-xs" style={{ color: "var(--mq-ink-2)" }}>
+                    外部 `.conf` 与订阅无法覆盖以下任何安全边界设置。
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                      Mixed 代理端口 (127.0.0.1)
+                    </label>
+                    <input
+                      type="number"
+                      value={policy.mixed_listen_port}
+                      onChange={(e) =>
+                        setPolicy({ ...policy, mixed_listen_port: Number(e.target.value) })
+                      }
+                      className="font-mono-tabular mq-subtle mt-1 w-full rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                      style={{ color: "var(--mq-ink)" }}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                      Clash API 端口 (随机 32B Bearer)
+                    </label>
+                    <input
+                      type="number"
+                      value={policy.clash_api_port}
+                      onChange={(e) =>
+                        setPolicy({ ...policy, clash_api_port: Number(e.target.value) })
+                      }
+                      className="font-mono-tabular mq-subtle mt-1 w-full rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                      style={{ color: "var(--mq-ink)" }}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                    IPv6 防旁路泄漏策略
+                  </label>
+                  <select
+                    value={policy.ipv6_mode}
+                    onChange={(e) =>
+                      setPolicy({
+                        ...policy,
+                        ipv6_mode: e.target.value as RuntimePolicy["ipv6_mode"],
+                      })
+                    }
+                    className="mq-subtle mt-1 w-full rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                    style={{ color: "var(--mq-ink)" }}
+                  >
+                    <option value="block_to_prevent_leak">
+                      屏蔽 IPv6 / AAAA 防泄漏（推荐：IPv4 直连节点零旁路）
+                    </option>
+                    <option value="prefer_ipv4">优先 IPv4，允许双栈代理</option>
+                    <option value="dual_stack">完整双栈 IPv4 + IPv6</option>
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                      远端 DoH DNS（强制 detour=proxy）
+                    </label>
+                    <input
+                      value={policy.remote_dns_server}
+                      onChange={(e) => setPolicy({ ...policy, remote_dns_server: e.target.value })}
+                      className="font-mono-tabular mq-subtle mt-1 w-full rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                      style={{ color: "var(--mq-ink)" }}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium" style={{ color: "var(--mq-ink-2)" }}>
+                      直连 / Bootstrap DNS
+                    </label>
+                    <input
+                      value={policy.direct_dns_server}
+                      onChange={(e) => setPolicy({ ...policy, direct_dns_server: e.target.value })}
+                      className="font-mono-tabular mq-subtle mt-1 w-full rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                      style={{ color: "var(--mq-ink)" }}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end pt-1">
+                  <button
+                    onClick={() => applyPolicyChange({}, true)}
+                    className="mq-btn mq-btn-primary rounded-xl px-5 py-2 text-xs font-semibold"
+                  >
+                    保存并应用策略
+                  </button>
+                </div>
+              </section>
             </div>
+          )}
+
+          {/* TAB 6: ABOUT MAXQ */}
+          {tab === "about" && (
+            <AboutView
+              about={aboutInfo}
+              soundEnabled={soundEnabled}
+              onToggleSound={() => setSoundEnabled((s) => !s)}
+              onTriggerLaunch={triggerLaunch}
+              onCopyDiagnostics={handleCopyDiagnostics}
+            />
           )}
         </main>
       </div>
 
-      {/* Import Modal (Paste / Local .conf / HTTPS Subscription URL) */}
-      {importOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs">
-          <div className="mq-panel flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
-              <h2 className="text-sm font-semibold text-white">安全导入与隔离审计</h2>
-              <button onClick={() => setImportOpen(false)} className="text-slate-400 hover:text-white">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
+      {/* Modals, Drawers & Playful Overlays */}
+      <ImportModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        importMethod={importMethod}
+        setImportMethod={setImportMethod}
+        importName={importName}
+        setImportName={setImportName}
+        importText={importText}
+        setImportText={setImportText}
+        subUrl={subUrl}
+        setSubUrl={setSubUrl}
+        preview={preview}
+        setPreview={setPreview}
+        approvedHostDomains={approvedHostDomains}
+        setApprovedHostDomains={setApprovedHostDomains}
+        busy={busy}
+        onFetchSubUrl={handleFetchSubUrl}
+        onPreviewImport={handlePreviewImport}
+        onCommitImport={handleCommitImport}
+      />
 
-            <div className="flex-1 space-y-4 overflow-y-auto p-5">
-              {/* 3-mode selector */}
-              <div className="grid grid-cols-3 gap-2 rounded-lg bg-[#090c10] p-1 text-xs">
-                {[
-                  { id: "paste" as ImportMethod, label: "粘贴链接 / 文本", icon: FileText },
-                  { id: "file" as ImportMethod, label: "本地 .conf 文件", icon: Upload },
-                  { id: "url" as ImportMethod, label: "HTTPS 订阅 URL", icon: Link2 },
-                ].map((m) => {
-                  const Icon = m.icon;
-                  return (
-                    <button
-                      key={m.id}
-                      onClick={() => setImportMethod(m.id)}
-                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 font-medium transition ${
-                        importMethod === m.id
-                          ? "bg-[#1a2433] text-white"
-                          : "text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      <Icon className="h-3.5 w-3.5" /> {m.label}
-                    </button>
-                  );
-                })}
-              </div>
+      <ProbeDrawer
+        node={inspectNode}
+        probeResult={probeResult}
+        probeLoading={probeLoading}
+        probeError={probeError}
+        onClose={() => setInspectNode(null)}
+        onReprobe={handleProbeNode}
+        onConfirmPin={handleConfirmPin}
+        onTemporaryOverride={handleTemporaryOverride}
+      />
 
-              <div>
-                <label className="text-xs text-slate-400">配置名称</label>
-                <input
-                  value={importName}
-                  onChange={(e) => setImportName(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
-                />
-              </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        nodes={proxyNodes}
+        theme={theme}
+        onConnectNode={handleStartNode}
+        onSwitchRouting={(m) => applyPolicyChange({ routing_mode: m }, true)}
+        onToggleTheme={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
+        onTriggerLaunch={triggerLaunch}
+        onNavigate={(nextTab) => setTab(nextTab)}
+      />
 
-              {importMethod === "url" && (
-                <div className="flex gap-2">
-                  <input
-                    value={subUrl}
-                    onChange={(e) => setSubUrl(e.target.value)}
-                    placeholder="https://example.com/subscribe (仅允许公网 HTTPS，自动防 SSRF)"
-                    className="font-mono-tabular flex-1 rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-xs text-white"
-                  />
-                  <button
-                    onClick={handleFetchSubUrl}
-                    disabled={busy || !subUrl.trim()}
-                    className="flex items-center gap-1.5 rounded-lg bg-sky-500/20 px-3.5 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:opacity-40"
-                  >
-                    <Download className="h-3.5 w-3.5" /> 拉取并审计
-                  </button>
-                </div>
-              )}
-
-              {importMethod === "file" && (
-                <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-slate-700 bg-[#090c10] py-8 text-xs text-slate-400 hover:border-sky-500/50 hover:text-slate-200">
-                  <Upload className="mb-2 h-6 w-6 text-sky-400" />
-                  <span>点击选择 Shadowrocket `.conf` / Clash `.yaml` / `sing-box` `.json` 文件</span>
-                  <input
-                    type="file"
-                    accept=".conf,.txt,.json,.yaml,.yml"
-                    className="hidden"
-                    onChange={async (e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      const text = await file.text();
-                      setImportText(text);
-                      setImportName(file.name.replace(/\.[^.]+$/, ""));
-                      setPreview(null);
-                      const res = await api.previewImport(text);
-                      setPreview(res);
-                      setApprovedHostDomains(new Set());
-                    }}
-                  />
-                </label>
-              )}
-
-              {importMethod === "paste" && (
-                <textarea
-                  rows={5}
-                  value={importText}
-                  onChange={(e) => {
-                    setImportText(e.target.value);
-                    setPreview(null);
-                  }}
-                  placeholder="trojan://... / anytls://... / hy2://... / tuic://... / vless://..."
-                  className="font-mono-tabular w-full rounded-lg border border-slate-800 bg-[#090c10] p-3 text-xs text-slate-200 outline-none focus:border-sky-500"
-                />
-              )}
-
-              {preview && (
-                <div className="space-y-3 rounded-xl border border-slate-800 bg-[#090c10] p-4">
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="rounded bg-sky-500/15 px-2 py-0.5 text-sky-300">
-                      {preview.format}
-                    </span>
-                    <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">
-                      节点 {preview.report.total_nodes_imported}
-                    </span>
-                    <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">
-                      规则 {preview.report.total_rules_imported}
-                    </span>
-                    {preview.report.stripped_sections.length > 0 && (
-                      <span className="rounded bg-rose-500/20 px-2 py-0.5 text-rose-300">
-                        已硬剥离: {preview.report.stripped_sections.join(", ")}
-                      </span>
-                    )}
-                  </div>
-
-                  {preview.report.findings.map((f, idx) => (
-                    <div
-                      key={idx}
-                      className={`rounded-lg border p-3 text-xs ${
-                        f.severity === "critical" || f.severity === "high"
-                          ? "border-rose-500/35 bg-rose-950/25 text-rose-200"
-                          : "border-amber-500/30 bg-amber-950/20 text-amber-200"
-                      }`}
-                    >
-                      <div className="font-semibold">
-                        [{f.severity.toUpperCase()} · {f.action.toUpperCase()}] {f.summary}
-                      </div>
-                      {f.samples.length > 0 && (
-                        <div className="font-mono-tabular mt-1 text-[11px] opacity-80">
-                          {f.samples.slice(0, 3).join(" | ")}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-
-                  {preview.hosts.length > 0 && (
-                    <div className="space-y-1.5">
-                      <div className="text-xs font-medium text-slate-300">
-                        勾选需要放行的 `[Host]` 映射（默认全部隔离）：
-                      </div>
-                      {preview.hosts.map((h) => (
-                        <label
-                          key={h.domain}
-                          className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-800 bg-[#111722] px-3 py-2 text-xs"
-                        >
-                          <span className="font-mono-tabular">
-                            {h.domain} → {h.target}{" "}
-                            <span className="text-amber-300">({h.classification})</span>
-                          </span>
-                          <input
-                            type="checkbox"
-                            checked={approvedHostDomains.has(h.domain)}
-                            onChange={(e) => {
-                              const next = new Set(approvedHostDomains);
-                              if (e.target.checked) next.add(h.domain);
-                              else next.delete(h.domain);
-                              setApprovedHostDomains(next);
-                            }}
-                            className="accent-sky-500"
-                          />
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center justify-end gap-2 border-t border-slate-800 px-5 py-3">
-              {importMethod === "paste" && (
-                <button
-                  onClick={handlePreviewImport}
-                  disabled={busy || !importText.trim()}
-                  className="rounded-lg border border-slate-700 bg-[#151c27] px-4 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-40"
-                >
-                  1. 安全扫描与预览
-                </button>
-              )}
-              <button
-                onClick={handleCommitImport}
-                disabled={busy || !preview}
-                className="rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-40"
-              >
-                确认导入至 MaxQ
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TLS TOFU Probe & Pin Inspector Drawer */}
-      {inspectNode && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/65 backdrop-blur-xs">
-          <div className="mq-panel flex h-full w-full max-w-lg flex-col border-y-0 border-r-0 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-white">TLS 证书探测与 TOFU 公钥固定</h2>
-                <p className="text-xs text-slate-400">{inspectNode.name}</p>
-              </div>
-              <button onClick={() => setInspectNode(null)} className="text-slate-400 hover:text-white">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex-1 space-y-4 overflow-y-auto p-5 text-xs">
-              <div className="space-y-1.5 rounded-xl border border-slate-800 bg-[#090c10] p-4">
-                <div>
-                  <span className="text-slate-400">拨号地址：</span>
-                  <span className="font-mono-tabular text-slate-200">
-                    {inspectNode.dial_override_server ?? inspectNode.server}:
-                    {inspectNode.server_port}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-slate-400">TLS SNI：</span>
-                  <span className="font-mono-tabular text-slate-200">
-                    {inspectNode.tls.server_name ?? inspectNode.server}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-slate-400">探测引擎：</span>
-                  <span className="text-sky-300">
-                    纯 Rust rustls / quinn（绕过 Windows Schannel，校验私钥签名，支持 Hysteria2 Salamander）
-                  </span>
-                </div>
-              </div>
-
-              <button
-                onClick={() => handleProbeNode(inspectNode)}
-                disabled={probeLoading}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-sky-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
-              >
-                <RefreshCw className={`h-4 w-4 ${probeLoading ? "animate-spin" : ""}`} />
-                {probeLoading ? "正在握手并提取服务端证书..." : "立即探测服务端证书指纹"}
-              </button>
-
-              {probeError && (
-                <div className="rounded-xl border border-rose-500/40 bg-rose-950/40 p-3 text-rose-200">
-                  <strong>探测或校验失败：</strong> {probeError}
-                </div>
-              )}
-
-              {probeResult && (
-                <div className="space-y-3 rounded-xl border border-slate-800 bg-[#090c10] p-4">
-                  {probeResult.outcome.status === "mismatch" && (
-                    <div className="rounded-lg border border-rose-500 bg-rose-950/70 p-3 text-rose-100">
-                      <div className="flex items-center gap-1.5 font-bold text-rose-300">
-                        <ShieldAlert className="h-4 w-4" /> 警告：证书公钥指纹发生变更（疑似 MITM）！
-                      </div>
-                      <div className="font-mono-tabular mt-2 text-[11px] break-all">
-                        <div>预期 SPKI: {probeResult.outcome.expected_spki_b64}</div>
-                        <div className="text-rose-300">
-                          实测 SPKI: {probeResult.outcome.observed_spki_b64}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {probeResult.outcome.status === "matched" && (
-                    <div className="flex items-center gap-2 rounded-lg bg-emerald-500/15 p-2.5 text-emerald-300">
-                      <CheckCircle2 className="h-4 w-4" /> 指纹与已有记录 / 导入 pin 完全一致
-                    </div>
-                  )}
-
-                  <div className="font-mono-tabular space-y-1.5 text-[11px] break-all">
-                    <div>
-                      <span className="text-slate-400">SPKI SHA-256 (Base64 · sing-box): </span>
-                      <span className="text-emerald-300">{probeResult.probed.spki_sha256_b64}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400">Cert SHA-256 (Hex · pcs/hy2): </span>
-                      <span className="text-slate-200">{probeResult.probed.cert_sha256_hex}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400">Subject: </span>
-                      <span>{probeResult.probed.subject}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400">Issuer: </span>
-                      <span>{probeResult.probed.issuer}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400">有效期: </span>
-                      <span>
-                        {probeResult.probed.not_before} ~ {probeResult.probed.not_after}
-                      </span>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleConfirmPin}
-                    className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400"
-                  >
-                    <ShieldCheck className="h-4 w-4" />
-                    {probeResult.outcome.status === "mismatch"
-                      ? "确认风险并轮换固定为此新公钥"
-                      : "信任并固定此证书公钥 (TOFU Pin)"}
-                  </button>
-                </div>
-              )}
-
-              {inspectNode.tls.verify_mode.mode === "insecure_legacy" && (
-                <div className="rounded-xl border border-amber-500/30 bg-amber-950/20 p-4">
-                  <div className="font-semibold text-amber-300">Scheme A 默认安全策略</div>
-                  <p className="mt-1 text-slate-400">
-                    强烈建议使用上方「探测并固定证书」消除中间人风险；仅在临时调试且知晓风险时放行单节点：
-                  </p>
-                  <label className="mt-3 flex cursor-pointer items-center gap-2 text-amber-200">
-                    <input
-                      type="checkbox"
-                      checked={inspectNode.tls.verify_mode.user_confirmed_override}
-                      onChange={(e) =>
-                        handleToggleInsecureOverride(inspectNode, e.target.checked)
-                      }
-                      className="accent-amber-500"
-                    />
-                    我已知晓 MITM 风险，临时允许此节点跳过证书验证
-                  </label>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      <LaunchEasterEgg launchKey={launchKey} />
     </div>
   );
 }
