@@ -1209,7 +1209,7 @@ fn cleanup_all_runtime(app_handle: &tauri::AppHandle, is_shutdown: bool) {
             let mut sup = state.supervisor.lock().await;
             sup.stop_sync();
         });
-    }
+    };
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1291,7 +1291,7 @@ pub fn run() {
                         let state = app_handle.state::<AppState>();
                         if let Ok(mut sp) = state.sysproxy.lock() {
                             let _ = sp.force_disable();
-                        }
+                        };
                     }
                     "quit" => {
                         cleanup_all_runtime(app_handle, true);
