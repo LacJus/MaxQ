@@ -507,7 +507,7 @@ pub fn validate_safe_remote_url(raw_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_non_public_ip(ip: IpAddr) -> bool {
+pub fn is_non_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_non_public_ipv4(v4),
         IpAddr::V6(v6) => {

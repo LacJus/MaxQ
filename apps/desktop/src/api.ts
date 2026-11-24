@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BatchPinSummary,
+  BuiltinRulesInfo,
   HostEntry,
   NodeConfig,
   ProbeNodeResult,
@@ -9,6 +11,7 @@ import type {
   SanitizedImport,
   StoredProfile,
   TrustRecord,
+  TunServiceStatus,
 } from "./types";
 
 export function isTauriRuntime(): boolean {
@@ -16,6 +19,17 @@ export function isTauriRuntime(): boolean {
 }
 
 export const api = {
+  getBuiltinRulesInfo: () => invoke<BuiltinRulesInfo>("get_builtin_rules_info"),
+
+  getTunServiceStatus: () => invoke<TunServiceStatus>("get_tun_service_status"),
+
+  installTunService: () => invoke<string>("install_tun_service"),
+
+  uninstallTunService: () => invoke<string>("uninstall_tun_service"),
+
+  fetchSubscriptionUrl: (url: string) =>
+    invoke<string>("fetch_subscription_url", { url }),
+
   previewImport: (rawInput: string) =>
     invoke<SanitizedImport>("preview_import", { rawInput }),
 
@@ -33,8 +47,14 @@ export const api = {
   updateProfileHosts: (profileId: string, hosts: HostEntry[]) =>
     invoke<StoredProfile>("update_profile_hosts", { profileId, hosts }),
 
+  testNodeLatency: (nodeId: string) =>
+    invoke<number>("test_node_latency", { nodeId }),
+
   probeNodeCertificate: (nodeId: string) =>
     invoke<ProbeNodeResult>("probe_node_certificate", { nodeId }),
+
+  batchProbeAndPinProfile: (profileId: string) =>
+    invoke<BatchPinSummary>("batch_probe_and_pin_profile", { profileId }),
 
   confirmNodePin: (nodeId: string, trustRecord: TrustRecord) =>
     invoke<NodeConfig>("confirm_node_pin", { nodeId, trustRecord }),

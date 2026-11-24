@@ -3,41 +3,66 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
-  FileWarning,
+  Cpu,
+  Download,
+  FileText,
+  Gauge,
   Globe,
   KeyRound,
+  Link2,
   Lock,
+  Network,
   Plus,
   Power,
   RefreshCw,
+  Search,
   Server,
   Settings,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Terminal,
   Trash2,
+  Upload,
   X,
 } from "lucide-react";
 import { api, isTauriRuntime } from "./api";
 import type {
+  BatchPinSummary,
+  BuiltinRulesInfo,
   NodeConfig,
   ProbeNodeResult,
   ProfileSummary,
+  ProxyMode,
+  RoutingMode,
   RuntimePolicy,
   RuntimeStatus,
   SanitizedImport,
   StoredProfile,
+  TunServiceStatus,
 } from "./types";
 
 type Tab = "nodes" | "security" | "logs" | "settings";
+type ImportMethod = "paste" | "file" | "url";
+
+const PROTOCOL_FILTERS: Array<{ id: string; label: string }> = [
+  { id: "all", label: "全部" },
+  { id: "trojan", label: "Trojan" },
+  { id: "any_tls", label: "AnyTLS" },
+  { id: "hysteria2", label: "Hysteria2" },
+  { id: "tuic", label: "TUIC" },
+  { id: "vless", label: "VLESS" },
+  { id: "vmess", label: "VMess" },
+  { id: "shadowsocks", label: "SS" },
+];
 
 function protocolLabel(p: NodeConfig["protocol"]["type"]): string {
   switch (p) {
     case "any_tls":
       return "AnyTLS";
     case "hysteria2":
-      return "Hysteria2";
+      return "Hy2";
     case "tuic":
       return "TUIC";
     case "vless":
@@ -54,40 +79,40 @@ function protocolLabel(p: NodeConfig["protocol"]["type"]): string {
 function tlsBadge(node: NodeConfig) {
   if (!node.tls.enabled) {
     return {
-      label: "No TLS",
-      cls: "bg-slate-800 text-slate-300 border-slate-700",
+      label: "明文/无 TLS",
+      cls: "bg-slate-800/90 text-slate-400",
       icon: Globe,
     };
   }
   switch (node.tls.verify_mode.mode) {
     case "pinned_spki":
       return {
-        label: "SPKI Pinned (TOFU)",
-        cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40",
+        label: "SPKI 已固定",
+        cls: "bg-emerald-500/12 text-emerald-300",
         icon: ShieldCheck,
       };
     case "system_ca":
       return {
-        label: "CA Verified",
-        cls: "bg-cyan-500/15 text-cyan-300 border-cyan-500/40",
+        label: "CA 校验",
+        cls: "bg-sky-500/12 text-sky-300",
         icon: Lock,
       };
     case "pending_pin_bootstrap":
       return {
-        label: "Pin Bootstrap Pending",
-        cls: "bg-amber-500/15 text-amber-300 border-amber-500/40",
+        label: "待核验 pcs",
+        cls: "bg-amber-500/15 text-amber-300",
         icon: KeyRound,
       };
     case "insecure_legacy":
       return node.tls.verify_mode.user_confirmed_override
         ? {
-            label: "Insecure Override",
-            cls: "bg-orange-500/15 text-orange-300 border-orange-500/40",
+            label: "临时放行",
+            cls: "bg-orange-500/15 text-orange-300",
             icon: AlertTriangle,
           }
         : {
-            label: "Unverified TLS (Blocked)",
-            cls: "bg-rose-500/15 text-rose-300 border-rose-500/40",
+            label: "未验证 (已阻断)",
+            cls: "bg-rose-500/15 text-rose-300",
             icon: ShieldAlert,
           };
   }
@@ -99,9 +124,20 @@ export default function App() {
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [profile, setProfile] = useState<StoredProfile | null>(null);
+  const [builtinRules, setBuiltinRules] = useState<BuiltinRulesInfo>({
+    rule_count: 8581,
+    description: "MaxQ 内置默认分流规则",
+  });
+  const [tunService, setTunService] = useState<TunServiceStatus>({
+    installed: false,
+    running: false,
+    tun_active: false,
+    singbox_sha256_verified: false,
+  });
   const [status, setStatus] = useState<RuntimeStatus>({
     running: false,
     system_proxy_enabled: false,
+    tun_active: false,
   });
   const [logs, setLogs] = useState<string[]>([]);
   const [policy, setPolicy] = useState<RuntimePolicy>({
@@ -111,17 +147,27 @@ export default function App() {
     clash_api_secret: "",
     clash_api_allowed_origins: ["http://tauri.localhost", "https://tauri.localhost"],
     tun_enabled: false,
+    proxy_mode: "system_proxy",
+    routing_mode: "rule",
+    rule_source: "profile_or_builtin",
     ipv6_mode: "block_to_prevent_leak",
     remote_dns_server: "1.1.1.1",
     direct_dns_server: "223.5.5.5",
   });
-  const [enableSysProxy, setEnableSysProxy] = useState(true);
-  const [bannerError, setBannerError] = useState<string | null>(null);
+
+  // Search, filter, latency & batch pin state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [protoFilter, setProtoFilter] = useState("all");
+  const [latencies, setLatencies] = useState<Record<string, number | "err" | "loading">>({});
+  const [batchPinning, setBatchPinning] = useState(false);
+  const [toast, setToast] = useState<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 
   // Import modal state
   const [importOpen, setImportOpen] = useState(false);
-  const [importName, setImportName] = useState("Imported Profile");
+  const [importMethod, setImportMethod] = useState<ImportMethod>("paste");
+  const [importName, setImportName] = useState("新导入配置");
   const [importText, setImportText] = useState("");
+  const [subUrl, setSubUrl] = useState("");
   const [preview, setPreview] = useState<SanitizedImport | null>(null);
   const [approvedHostDomains, setApprovedHostDomains] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -132,19 +178,28 @@ export default function App() {
   const [probeLoading, setProbeLoading] = useState(false);
   const [probeError, setProbeError] = useState<string | null>(null);
 
+  const showToast = (kind: "info" | "ok" | "err", text: string) => {
+    setToast({ kind, text });
+  };
+
   const refreshAll = async () => {
     if (!inTauri) return;
     try {
-      const [list, st, pol, l] = await Promise.all([
+      const [list, st, pol, l, br, tunSt] = await Promise.all([
         api.listProfiles(),
         api.getRuntimeStatus(),
         api.getRuntimePolicy(),
         api.getRuntimeLogs(),
+        api.getBuiltinRulesInfo(),
+        api.getTunServiceStatus(),
       ]);
       setProfiles(list);
       setStatus(st);
       setPolicy(pol);
       setLogs(l);
+      setBuiltinRules(br);
+      setTunService(tunSt);
+
       const targetId = selectedProfileId ?? list[0]?.id ?? null;
       if (targetId) {
         setSelectedProfileId(targetId);
@@ -154,7 +209,7 @@ export default function App() {
         setProfile(null);
       }
     } catch (err) {
-      setBannerError(String(err));
+      showToast("err", String(err));
     }
   };
 
@@ -163,34 +218,134 @@ export default function App() {
     if (!inTauri) return;
     const timer = setInterval(async () => {
       try {
-        const [st, l] = await Promise.all([api.getRuntimeStatus(), api.getRuntimeLogs()]);
+        const [st, l, tunSt] = await Promise.all([
+          api.getRuntimeStatus(),
+          api.getRuntimeLogs(),
+          api.getTunServiceStatus(),
+        ]);
         setStatus(st);
         setLogs(l);
+        setTunService(tunSt);
       } catch {
-        // ignore transient poll error
+        // ignore transient polling error
       }
-    }, 2000);
+    }, 2500);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProfileId]);
 
-  const { metadataNodes, proxyNodes } = useMemo(() => {
+  const { metadataNodes, proxyNodes, unverifiedCount } = useMemo(() => {
     const all = profile?.nodes ?? [];
-    return {
-      metadataNodes: all.filter((n) => n.is_metadata_node),
-      proxyNodes: all.filter((n) => !n.is_metadata_node),
-    };
+    const meta = all.filter((n) => n.is_metadata_node);
+    const real = all.filter((n) => !n.is_metadata_node);
+    const unverified = real.filter(
+      (n) =>
+        n.tls.enabled &&
+        (n.tls.verify_mode.mode === "insecure_legacy" ||
+          n.tls.verify_mode.mode === "pending_pin_bootstrap")
+    ).length;
+    return { metadataNodes: meta, proxyNodes: real, unverifiedCount: unverified };
   }, [profile]);
 
+  const filteredNodes = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return proxyNodes.filter((n) => {
+      if (protoFilter !== "all" && n.protocol.type !== protoFilter) return false;
+      if (!q) return true;
+      return (
+        n.name.toLowerCase().includes(q) ||
+        n.server.toLowerCase().includes(q) ||
+        (n.tls.server_name ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [proxyNodes, protoFilter, searchQuery]);
+
+  const applyPolicyChange = async (patch: Partial<RuntimePolicy>, reconnectIfRunning = true) => {
+    const nextPolicy: RuntimePolicy = { ...policy, ...patch };
+    setPolicy(nextPolicy);
+    if (!inTauri) return;
+    try {
+      const saved = await api.updateRuntimePolicy(nextPolicy);
+      setPolicy(saved);
+      if (reconnectIfRunning && status.running && profile && status.active_node_id) {
+        const st = await api.startProxy(
+          profile.id,
+          status.active_node_id,
+          saved.proxy_mode === "system_proxy"
+        );
+        setStatus(st);
+        showToast("ok", "策略已热更新并重新应用到运行中内核");
+      }
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleSwitchProxyMode = async (mode: ProxyMode) => {
+    if (mode === "tun" && inTauri && !tunService.running) {
+      showToast(
+        "info",
+        "TUN 模式需要先安装 MaxQ 安全加固 Windows 服务（点击右侧「安装 TUN 服务」按钮触发 UAC）"
+      );
+      setTab("security");
+      return;
+    }
+    await applyPolicyChange({ proxy_mode: mode, tun_enabled: mode === "tun" }, true);
+  };
+
+  const handleInstallTunService = async () => {
+    try {
+      const msg = await api.installTunService();
+      showToast("info", msg);
+      setTimeout(async () => {
+        const st = await api.getTunServiceStatus();
+        setTunService(st);
+        if (st.running) {
+          showToast("ok", "MaxQ 安全加固 TUN 服务已安装并运行（SHA-256 校验通过）");
+        }
+      }, 2500);
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleUninstallTunService = async () => {
+    try {
+      const msg = await api.uninstallTunService();
+      showToast("info", msg);
+      await applyPolicyChange({ proxy_mode: "system_proxy", tun_enabled: false }, false);
+      setTimeout(async () => {
+        setTunService(await api.getTunServiceStatus());
+      }, 2000);
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleFetchSubUrl = async () => {
+    setBusy(true);
+    try {
+      const body = await api.fetchSubscriptionUrl(subUrl);
+      setImportText(body);
+      const res = await api.previewImport(body);
+      setPreview(res);
+      setApprovedHostDomains(new Set());
+      showToast("ok", `订阅拉取成功，已识别 ${res.report.total_nodes_imported} 个节点`);
+    } catch (err) {
+      showToast("err", String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handlePreviewImport = async () => {
-    setBannerError(null);
     setBusy(true);
     try {
       const res = await api.previewImport(importText);
       setPreview(res);
       setApprovedHostDomains(new Set());
     } catch (err) {
-      setBannerError(String(err));
+      showToast("err", String(err));
     } finally {
       setBusy(false);
     }
@@ -207,11 +362,13 @@ export default function App() {
       );
       setImportOpen(false);
       setImportText("");
+      setSubUrl("");
       setPreview(null);
       setSelectedProfileId(newId);
       await refreshAll();
+      showToast("ok", "配置已安全导入至本地 SQLite 信任库");
     } catch (err) {
-      setBannerError(String(err));
+      showToast("err", String(err));
     } finally {
       setBusy(false);
     }
@@ -219,13 +376,20 @@ export default function App() {
 
   const handleStartNode = async (node: NodeConfig) => {
     if (!profile) return;
-    setBannerError(null);
     try {
-      const st = await api.startProxy(profile.id, node.id, enableSysProxy);
+      const st = await api.startProxy(
+        profile.id,
+        node.id,
+        policy.proxy_mode === "system_proxy"
+      );
       setStatus(st);
+      showToast(
+        "ok",
+        `已通过 ${st.tun_active ? "TUN 虚拟网卡" : "系统代理"} 连接 ${node.name}`
+      );
     } catch (err) {
       const msg = String(err);
-      setBannerError(msg);
+      showToast("err", msg);
       if (msg.includes("Scheme A") || msg.includes("PendingPinBootstrap")) {
         setInspectNode(node);
         setProbeResult(null);
@@ -235,13 +399,47 @@ export default function App() {
   };
 
   const handleStopProxy = async () => {
-    setBannerError(null);
     try {
       const st = await api.stopProxy();
       setStatus(st);
+      showToast("info", "已断开连接并恢复网络设置");
     } catch (err) {
-      setBannerError(String(err));
+      showToast("err", String(err));
     }
+  };
+
+  const handleBatchProbeAndPin = async () => {
+    if (!profile) return;
+    setBatchPinning(true);
+    try {
+      const summary: BatchPinSummary = await api.batchProbeAndPinProfile(profile.id);
+      await refreshAll();
+      showToast(
+        summary.failed_nodes === 0 ? "ok" : "info",
+        `去重探测 ${summary.probed_endpoints} 个入口，成功固定 ${summary.pinned_nodes} 个节点${
+          summary.failed_nodes > 0 ? `，失败 ${summary.failed_nodes} 个` : ""
+        }`
+      );
+    } catch (err) {
+      showToast("err", String(err));
+    } finally {
+      setBatchPinning(false);
+    }
+  };
+
+  const handleTestLatency = async (node: NodeConfig) => {
+    setLatencies((prev) => ({ ...prev, [node.id]: "loading" }));
+    try {
+      const ms = await api.testNodeLatency(node.id);
+      setLatencies((prev) => ({ ...prev, [node.id]: ms }));
+    } catch {
+      setLatencies((prev) => ({ ...prev, [node.id]: "err" }));
+    }
+  };
+
+  const handleTestAllLatencies = async () => {
+    const batch = filteredNodes.slice(0, 20);
+    await Promise.all(batch.map((n) => handleTestLatency(n)));
   };
 
   const handleProbeNode = async (node: NodeConfig) => {
@@ -265,6 +463,7 @@ export default function App() {
       const updated = await api.confirmNodePin(inspectNode.id, probeResult.proposed_trust_record);
       setInspectNode(updated);
       await refreshAll();
+      showToast("ok", `已固定 ${updated.name} 的公钥 SPKI 指纹`);
     } catch (err) {
       setProbeError(String(err));
     }
@@ -280,35 +479,37 @@ export default function App() {
     }
   };
 
-  const handleSavePolicy = async () => {
-    try {
-      const saved = await api.updateRuntimePolicy(policy);
-      setPolicy(saved);
-    } catch (err) {
-      setBannerError(String(err));
-    }
-  };
+  const activeRuleCountLabel =
+    policy.routing_mode === "global"
+      ? "全局代理"
+      : policy.routing_mode === "direct"
+      ? "全局直连"
+      : policy.rule_source === "builtin_default" || (profile?.rules.length ?? 0) === 0
+      ? `内置 ${builtinRules.rule_count.toLocaleString()} 条分流`
+      : `配置 ${profile?.rules.length.toLocaleString()} 条分流`;
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
-      {/* Sidebar */}
-      <aside className="flex w-60 flex-col border-r border-slate-800/80 bg-slate-900/60 p-4">
-        <div className="mb-6 flex items-center gap-2.5 px-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 shadow-lg shadow-cyan-500/20">
-            <Shield className="h-5 w-5 text-white" />
+    <div className="flex h-screen w-screen overflow-hidden bg-[#090c10] text-slate-100">
+      {/* Left Navigation Rail */}
+      <aside className="mq-panel flex w-60 shrink-0 flex-col border-y-0 border-l-0 p-4">
+        <div className="mb-6 flex items-center gap-3 px-1.5">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/15 text-sky-400 ring-1 ring-sky-400/25">
+            <Shield className="h-5 w-5" />
           </div>
           <div>
-            <div className="text-base font-bold tracking-tight text-white">MaxQ</div>
-            <div className="text-[11px] text-slate-400">sing-box v1.14 · Zero-Trust</div>
+            <div className="text-[15px] font-semibold tracking-tight text-white">MaxQ</div>
+            <div className="font-mono-tabular text-[11px] text-slate-400">
+              v0.2 · sing-box 1.14.4
+            </div>
           </div>
         </div>
 
         <nav className="flex-1 space-y-1">
           {[
-            { id: "nodes" as Tab, label: "节点与配置", icon: Server },
-            { id: "security" as Tab, label: "安全隔离与规则", icon: ShieldCheck },
+            { id: "nodes" as Tab, label: "节点与测速", icon: Server },
+            { id: "security" as Tab, label: "TUN 服务与规则", icon: ShieldCheck },
             { id: "logs" as Tab, label: "运行日志", icon: Terminal },
-            { id: "settings" as Tab, label: "防泄漏与内核设置", icon: Settings },
+            { id: "settings" as Tab, label: "防泄漏与内核", icon: Settings },
           ].map((item) => {
             const Icon = item.icon;
             const active = tab === item.id;
@@ -316,209 +517,347 @@ export default function App() {
               <button
                 key={item.id}
                 onClick={() => setTab(item.id)}
-                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${
+                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition ${
                   active
-                    ? "bg-cyan-500/15 text-cyan-300 ring-1 ring-cyan-500/30"
-                    : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                    ? "bg-[#1a2433] text-white"
+                    : "text-slate-400 hover:bg-[#141b26] hover:text-slate-200"
                 }`}
               >
-                <Icon className="h-4 w-4" />
+                <Icon className={`h-4 w-4 ${active ? "text-sky-400" : "text-slate-500"}`} />
                 {item.label}
               </button>
             );
           })}
         </nav>
 
-        {/* Connection status card */}
-        <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-slate-400">内核状态</span>
+        {/* Bottom Runtime Status Capsule */}
+        <div className="mt-4 rounded-xl border border-slate-800/80 bg-[#0b0f16] p-3.5">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="text-slate-400">引擎状态</span>
             <span
-              className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-                status.running
-                  ? "bg-emerald-500/15 text-emerald-300"
-                  : "bg-slate-800 text-slate-400"
+              className={`inline-flex items-center gap-1.5 font-medium ${
+                status.running ? "text-emerald-400" : "text-slate-500"
               }`}
             >
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  status.running ? "bg-emerald-400" : "bg-slate-500"
+                  status.running ? "bg-emerald-400" : "bg-slate-600"
                 }`}
               />
-              {status.running ? "运行中" : "已停止"}
+              {status.running
+                ? status.tun_active
+                  ? "TUN 运行中"
+                  : "系统代理中"
+                : "待机"}
             </span>
           </div>
-          <div className="mt-2 truncate text-xs text-slate-300">
-            {status.active_node_name ?? "未连接节点"}
+
+          <div className="mt-2 truncate text-xs font-medium text-slate-200">
+            {status.active_node_name ?? "未选择节点"}
           </div>
+          <div className="mt-1 font-mono-tabular text-[11px] text-slate-500">
+            {activeRuleCountLabel}
+          </div>
+
           {status.running && (
             <button
               onClick={handleStopProxy}
-              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-rose-500/15 px-3 py-1.5 text-xs font-medium text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/25"
+              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-rose-500/12 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20"
             >
-              <Power className="h-3.5 w-3.5" /> 断开并恢复系统代理
+              <Power className="h-3.5 w-3.5" /> 断开连接
             </button>
           )}
         </div>
       </aside>
 
-      {/* Main content */}
-      <main className="flex flex-1 flex-col overflow-hidden">
-        {/* Global MITM Alert Banner */}
+      {/* Main Workspace */}
+      <div className="flex flex-1 flex-col overflow-hidden">
+        {/* Global MITM Critical Alert */}
         {status.last_mitm_alert && (
-          <div className="flex items-center justify-between border-b border-rose-500/40 bg-rose-950/90 px-6 py-3 text-sm text-rose-100">
-            <div className="flex items-center gap-2.5">
-              <ShieldAlert className="h-5 w-5 text-rose-400" />
-              <span>
-                <strong>高危安全告警（疑似 MITM 或服务端证书公钥变更）：</strong> 检测到未受信任的远端公钥 SPKI{" "}
-                <code className="rounded bg-rose-900/80 px-1.5 py-0.5 font-mono text-xs">
-                  {status.last_mitm_alert}
-                </code>
-              </span>
-            </div>
+          <div className="flex items-center gap-3 border-b border-rose-500/40 bg-rose-950/90 px-6 py-3 text-xs text-rose-100">
+            <ShieldAlert className="h-4 w-4 shrink-0 text-rose-400" />
+            <span>
+              <strong>证书公钥变更 / 疑似 MITM 告警：</strong> 检测到未受信任的远端公钥{" "}
+              <code className="font-mono-tabular rounded bg-rose-900/80 px-1.5 py-0.5">
+                {status.last_mitm_alert}
+              </code>
+            </span>
           </div>
         )}
 
-        {bannerError && (
-          <div className="flex items-center justify-between border-b border-amber-500/30 bg-amber-950/50 px-6 py-2.5 text-xs text-amber-200">
-            <span>{bannerError}</span>
-            <button onClick={() => setBannerError(null)} className="text-amber-400 hover:text-white">
-              <X className="h-4 w-4" />
+        {/* Toast feedback bar */}
+        {toast && (
+          <div
+            className={`flex items-center justify-between border-b px-6 py-2 text-xs ${
+              toast.kind === "err"
+                ? "border-rose-500/30 bg-rose-950/40 text-rose-200"
+                : toast.kind === "ok"
+                ? "border-emerald-500/30 bg-emerald-950/40 text-emerald-200"
+                : "border-sky-500/30 bg-sky-950/40 text-sky-200"
+            }`}
+          >
+            <span>{toast.text}</span>
+            <button onClick={() => setToast(null)} className="opacity-70 hover:opacity-100">
+              <X className="h-3.5 w-3.5" />
             </button>
           </div>
         )}
 
-        {!inTauri && (
-          <div className="border-b border-cyan-500/20 bg-cyan-950/30 px-6 py-2 text-xs text-cyan-300">
-            当前处于浏览器静态预览模式；运行 Tauri v2 桌面端时将自动连接 Rust 核心引擎与无 Schannel 证书探测器。
-          </div>
-        )}
+        {/* Unified Top Command Deck */}
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/70 bg-[#0c1017] px-6 py-3.5">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Routing Mode Segmented Switch */}
+            <div className="flex items-center rounded-lg border border-slate-800 bg-[#090c10] p-0.5 text-xs">
+              {(
+                [
+                  { id: "rule", label: "规则分流" },
+                  { id: "global", label: "全局" },
+                  { id: "direct", label: "直连" },
+                ] as Array<{ id: RoutingMode; label: string }>
+              ).map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => applyPolicyChange({ routing_mode: m.id }, true)}
+                  className={`rounded-md px-2.5 py-1 font-medium transition ${
+                    policy.routing_mode === m.id
+                      ? "bg-[#1c2636] text-white"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
 
-        {/* Header */}
-        <header className="flex items-center justify-between border-b border-slate-800/80 px-6 py-4">
-          <div className="flex items-center gap-3">
-            <h1 className="text-lg font-semibold text-white">
-              {tab === "nodes" && "节点与订阅"}
-              {tab === "security" && "安全隔离与 [Host] 审计"}
-              {tab === "logs" && "sing-box 实时运行日志"}
-              {tab === "settings" && "直连防泄漏与内核策略"}
-            </h1>
-            {profiles.length > 0 && tab === "nodes" && (
-              <select
-                value={selectedProfileId ?? ""}
-                onChange={(e) => setSelectedProfileId(e.target.value)}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-500"
+            {/* Engine Mode Segmented Switch: System Proxy vs Hardened TUN */}
+            <div className="flex items-center rounded-lg border border-slate-800 bg-[#090c10] p-0.5 text-xs">
+              <button
+                onClick={() => handleSwitchProxyMode("system_proxy")}
+                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+                  policy.proxy_mode === "system_proxy"
+                    ? "bg-[#1c2636] text-white"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
               >
-                {profiles.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.node_count} 节点 · {p.rule_count} 规则)
-                  </option>
-                ))}
-              </select>
-            )}
+                <Globe className="h-3.5 w-3.5" /> 系统代理
+              </button>
+              <button
+                onClick={() => handleSwitchProxyMode("tun")}
+                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+                  policy.proxy_mode === "tun"
+                    ? "bg-emerald-500/20 text-emerald-300"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <Network className="h-3.5 w-3.5" /> TUN 模式
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    tunService.running ? "bg-emerald-400" : "bg-amber-400"
+                  }`}
+                />
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-              <input
-                type="checkbox"
-                checked={enableSysProxy}
-                onChange={(e) => setEnableSysProxy(e.target.checked)}
-                className="rounded border-slate-700 bg-slate-900 accent-cyan-500"
-              />
-              连接时自动设置系统代理
-            </label>
+          <div className="flex items-center gap-2.5">
+            {!tunService.running && inTauri && (
+              <button
+                onClick={handleInstallTunService}
+                className="flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#151c27] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/40 hover:text-sky-300"
+              >
+                <Cpu className="h-3.5 w-3.5" /> 安装 TUN 服务 (UAC)
+              </button>
+            )}
             <button
               onClick={() => setImportOpen(true)}
-              className="flex items-center gap-1.5 rounded-lg bg-cyan-500 px-3.5 py-2 text-xs font-semibold text-slate-950 shadow-sm hover:bg-cyan-400"
+              className="flex items-center gap-1.5 rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400"
             >
-              <Plus className="h-4 w-4" /> 导入链接 / .conf
+              <Plus className="h-3.5 w-3.5" /> 导入节点 / 订阅
             </button>
           </div>
         </header>
 
-        {/* Tab body */}
-        <div className="flex-1 overflow-y-auto p-6">
+        {/* Main Content Viewport */}
+        <main className="flex-1 overflow-y-auto px-6 py-5">
           {tab === "nodes" && (
-            <div className="space-y-4">
-              {metadataNodes.length > 0 && (
-                <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-2.5 text-xs text-slate-300">
-                  <Activity className="h-4 w-4 text-cyan-400" />
+            <div className="mx-auto max-w-6xl space-y-4">
+              {/* Profile Selector & Metadata Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {profiles.length > 0 && (
+                    <select
+                      value={selectedProfileId ?? ""}
+                      onChange={(e) => setSelectedProfileId(e.target.value)}
+                      className="rounded-lg border border-slate-800 bg-[#111722] px-3 py-1.5 text-xs font-medium text-slate-200 outline-none focus:border-sky-500"
+                    >
+                      {profiles.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} · {p.node_count} 节点
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
                   {metadataNodes.map((m) => (
                     <span
                       key={m.id}
-                      className="rounded-md bg-slate-800 px-2.5 py-1 font-mono text-[11px] text-slate-200"
+                      className="font-mono-tabular inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111722] px-2.5 py-1 text-[11px] text-slate-300"
                     >
+                      <Activity className="h-3 w-3 text-sky-400" />
                       {m.name}
                     </span>
                   ))}
                 </div>
+
+                {proxyNodes.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleTestAllLatencies}
+                      className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-[#111722] px-3 py-1.5 text-xs text-slate-300 hover:border-slate-700 hover:text-white"
+                    >
+                      <Gauge className="h-3.5 w-3.5" /> 批量测速
+                    </button>
+                    {unverifiedCount > 0 && (
+                      <button
+                        onClick={handleBatchProbeAndPin}
+                        disabled={batchPinning}
+                        className="flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-50"
+                      >
+                        <Sparkles className={`h-3.5 w-3.5 ${batchPinning ? "animate-spin" : ""}`} />
+                        {batchPinning
+                          ? "并发探测固定中..."
+                          : `一键批量探测并固定 (${unverifiedCount})`}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Search & Protocol Filters */}
+              {proxyNodes.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="relative w-64">
+                    <Search className="pointer-events-none absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500" />
+                    <input
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="搜索节点名 / 域名 / SNI..."
+                      className="w-full rounded-lg border border-slate-800 bg-[#111722] py-1.5 pl-8 pr-3 text-xs text-slate-200 placeholder:text-slate-500 outline-none focus:border-sky-500"
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {PROTOCOL_FILTERS.map((f) => (
+                      <button
+                        key={f.id}
+                        onClick={() => setProtoFilter(f.id)}
+                        className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition ${
+                          protoFilter === f.id
+                            ? "bg-sky-500/20 text-sky-300"
+                            : "bg-[#111722] text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               )}
 
-              {proxyNodes.length === 0 ? (
-                <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800 py-20 text-center">
-                  <Shield className="mb-3 h-10 w-10 text-slate-600" />
-                  <p className="text-sm font-medium text-slate-300">尚未导入任何代理节点</p>
-                  <p className="mt-1 text-xs text-slate-500">
-                    支持 Shadowrocket 单条分享链（trojan / anytls / hy2 / tuic / vless / vmess / ss）、.conf 配置文件与 HTTP 订阅
+              {/* Nodes Grid */}
+              {filteredNodes.length === 0 ? (
+                <div className="mq-panel flex flex-col items-center justify-center rounded-2xl border-dashed py-20 text-center">
+                  <Shield className="mb-3 h-9 w-9 text-slate-600" />
+                  <p className="text-sm font-medium text-slate-200">
+                    {proxyNodes.length === 0 ? "尚未导入任何节点" : "没有匹配的筛选节点"}
+                  </p>
+                  <p className="mt-1.5 max-w-md text-xs text-slate-500">
+                    导入单条 Shadowrocket 链接（trojan / anytls / hy2 / tuic / vless / vmess / ss）即可自动启用内置{" "}
+                    {builtinRules.rule_count.toLocaleString()} 条默认分流规则，无需手写规则文件。
                   </p>
                   <button
                     onClick={() => setImportOpen(true)}
-                    className="mt-4 rounded-lg bg-slate-800 px-4 py-2 text-xs font-medium text-cyan-300 hover:bg-slate-700"
+                    className="mt-5 rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400"
                   >
-                    立即导入并执行安全审计
+                    立即导入并审计
                   </button>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                  {proxyNodes.map((node) => {
+                  {filteredNodes.map((node) => {
                     const badge = tlsBadge(node);
                     const BadgeIcon = badge.icon;
                     const isActive = status.running && status.active_node_id === node.id;
+                    const lat = latencies[node.id];
+
                     return (
                       <div
                         key={node.id}
-                        className={`flex flex-col justify-between rounded-xl border p-4 transition ${
-                          isActive
-                            ? "border-emerald-500/50 bg-emerald-950/20"
-                            : "border-slate-800 bg-slate-900/50 hover:border-slate-700"
+                        className={`mq-card flex flex-col justify-between rounded-xl p-4 ${
+                          isActive ? "!border-emerald-500/45 !bg-emerald-950/15" : ""
                         }`}
                       >
-                        <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                              <span className="rounded bg-[#0d121a] px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wide text-sky-400">
                                 {protocolLabel(node.protocol.type)}
                               </span>
-                              <h3 className="truncate text-sm font-semibold text-white">
+                              <h3 className="truncate text-[13px] font-semibold text-white">
                                 {node.name}
                               </h3>
                             </div>
-                            <div className="mt-1.5 truncate font-mono text-xs text-slate-400">
+                            <div className="font-mono-tabular mt-1.5 truncate text-[11px] text-slate-400">
                               {node.dial_override_server ?? node.server}:{node.server_port}
                               {node.tls.server_name && (
                                 <span className="ml-2 text-slate-500">
-                                  SNI: {node.tls.server_name}
+                                  · {node.tls.server_name}
                                 </span>
                               )}
                             </div>
                           </div>
 
-                          <span
-                            className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${badge.cls}`}
-                          >
-                            <BadgeIcon className="h-3 w-3" />
-                            {badge.label}
-                          </span>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            {lat !== undefined && (
+                              <span
+                                className={`font-mono-tabular rounded-md px-2 py-0.5 text-[11px] ${
+                                  lat === "loading"
+                                    ? "bg-slate-800 text-slate-400"
+                                    : lat === "err"
+                                    ? "bg-rose-500/15 text-rose-300"
+                                    : lat < 120
+                                    ? "bg-emerald-500/15 text-emerald-300"
+                                    : "bg-amber-500/15 text-amber-300"
+                                }`}
+                              >
+                                {lat === "loading"
+                                  ? "..."
+                                  : lat === "err"
+                                  ? "超时"
+                                  : `${lat} ms`}
+                              </span>
+                            )}
+                            <span
+                              className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium ${badge.cls}`}
+                            >
+                              <BadgeIcon className="h-3 w-3" />
+                              {badge.label}
+                            </span>
+                          </div>
                         </div>
 
                         <div className="mt-4 flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => handleTestLatency(node)}
+                            className="rounded-lg bg-[#0d121a] px-2.5 py-1.5 text-[11px] text-slate-400 hover:text-slate-200"
+                          >
+                            测速
+                          </button>
                           {node.tls.enabled && (
                             <button
                               onClick={() => handleProbeNode(node)}
-                              className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800/80 px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:border-cyan-500/50 hover:text-cyan-300"
+                              className="flex items-center gap-1 rounded-lg bg-[#0d121a] px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-slate-800"
                             >
-                              <KeyRound className="h-3.5 w-3.5" /> 探测 & 固定证书
+                              <KeyRound className="h-3 w-3 text-sky-400" /> 探测固定
                             </button>
                           )}
                           <button
@@ -526,7 +865,7 @@ export default function App() {
                             className={`flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold ${
                               isActive
                                 ? "bg-rose-500/20 text-rose-300 hover:bg-rose-500/30"
-                                : "bg-cyan-500/15 text-cyan-300 ring-1 ring-cyan-500/30 hover:bg-cyan-500/25"
+                                : "bg-sky-500/15 text-sky-300 hover:bg-sky-500/25"
                             }`}
                           >
                             <Power className="h-3.5 w-3.5" />
@@ -542,15 +881,142 @@ export default function App() {
           )}
 
           {tab === "security" && (
-            <div className="space-y-6">
-              <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div className="mx-auto max-w-4xl space-y-5">
+              {/* Hardened Windows TUN Service Card */}
+              <section className="mq-panel rounded-xl p-5">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Network className="h-4 w-4 text-sky-400" />
+                      <h2 className="text-sm font-semibold text-white">
+                        Windows 安全加固 TUN 虚拟网卡服务（防 LPE 架构）
+                      </h2>
+                      <span
+                        className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                          tunService.running
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : "bg-slate-800 text-slate-400"
+                        }`}
+                      >
+                        {tunService.running ? "服务运行中" : "未安装 / 未运行"}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      GUI 始终以普通用户运行；仅 TUN 服务按需提权。采用 SDDL DACL 锁定 Named Pipe、调用方进程路径白名单校验、
+                      `sing-box.exe` 硬编码路径与 SHA-256 完整性核验、以及 SYSTEM 独占运行目录防 `wintun.dll` 劫持。
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={async () => setTunService(await api.getTunServiceStatus())}
+                      className="rounded-lg border border-slate-700 bg-[#151c27] px-3 py-1.5 text-xs text-slate-300 hover:text-white"
+                    >
+                      刷新
+                    </button>
+                    {!tunService.running ? (
+                      <button
+                        onClick={handleInstallTunService}
+                        className="rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400"
+                      >
+                        安装并启动 TUN 服务 (UAC)
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleUninstallTunService}
+                        className="rounded-lg bg-rose-500/15 px-3.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25"
+                      >
+                        卸载 TUN 服务 (UAC)
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                  {[
+                    {
+                      label: "Named Pipe ACL",
+                      val: "SDDL + 禁远程",
+                      ok: true,
+                    },
+                    {
+                      label: "调用方进程校验",
+                      val: "安装目录白名单",
+                      ok: true,
+                    },
+                    {
+                      label: "sing-box SHA-256",
+                      val: tunService.running
+                        ? tunService.singbox_sha256_verified
+                          ? "已核验通过"
+                          : "校验异常"
+                        : "启动前强制核验",
+                      ok: !tunService.running || tunService.singbox_sha256_verified,
+                    },
+                    {
+                      label: "wintun 防劫持",
+                      val: "SYSTEM 独占目录",
+                      ok: true,
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="rounded-lg border border-slate-800/80 bg-[#0b0f16] px-3 py-2.5"
+                    >
+                      <div className="text-[11px] text-slate-500">{item.label}</div>
+                      <div
+                        className={`mt-1 font-medium ${
+                          item.ok ? "text-emerald-300" : "text-rose-300"
+                        }`}
+                      >
+                        {item.val}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {/* Built-in Default Rules Engine Card */}
+              <section className="mq-panel rounded-xl p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-sm font-semibold text-white">
+                      默认内置分流规则库（{builtinRules.rule_count.toLocaleString()} 条规则）
+                    </h2>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {builtinRules.description}。导入单条分享链时自动生效，国内流量直连、海外走代理。
+                    </p>
+                  </div>
+
+                  <select
+                    value={policy.rule_source}
+                    onChange={(e) =>
+                      applyPolicyChange(
+                        { rule_source: e.target.value as RuntimePolicy["rule_source"] },
+                        true
+                      )
+                    }
+                    className="rounded-lg border border-slate-700 bg-[#0b0f16] px-3 py-1.5 text-xs text-slate-200"
+                  >
+                    <option value="profile_or_builtin">
+                      优先使用导入 .conf 规则（无规则时自动用内置规则）
+                    </option>
+                    <option value="builtin_default">
+                      始终强制使用 MaxQ 内置默认规则
+                    </option>
+                  </select>
+                </div>
+              </section>
+
+              {/* Quarantined [Host] Audit Card */}
+              <section className="mq-panel rounded-xl p-5">
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-sm font-semibold text-white">
-                      隔离的 `[Host]` 域名映射审计（默认全部禁用）
+                      `[Host]` 域名映射隔离审计（默认全禁用）
                     </h2>
                     <p className="mt-1 text-xs text-slate-400">
-                      仅当节点依赖 `use-local-host-item-for-proxy` 别名连接时建议放行「代理节点别名」；第三方域名覆盖默认严禁放行。
+                      仅放行确认为节点入口别名的 `proxy_endpoint_alias`；第三方域名覆盖默认阻断以防劫持。
                     </p>
                   </div>
                   {profile && (
@@ -574,14 +1040,14 @@ export default function App() {
                     profile!.hosts.map((h, idx) => (
                       <div
                         key={`${h.domain}-${idx}`}
-                        className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/70 px-3.5 py-2.5 text-xs"
+                        className="flex items-center justify-between rounded-lg border border-slate-800/80 bg-[#0b0f16] px-3.5 py-2.5 text-xs"
                       >
                         <div>
-                          <span className="font-mono text-slate-200">
+                          <span className="font-mono-tabular text-slate-200">
                             {h.domain} → {h.target}
                           </span>
                           <span
-                            className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                            className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ${
                               h.classification === "proxy_endpoint_alias"
                                 ? "bg-amber-500/15 text-amber-300"
                                 : h.classification === "local_domain"
@@ -606,27 +1072,29 @@ export default function App() {
                             const next = await api.updateProfileHosts(profile!.id, updated);
                             setProfile(next);
                           }}
-                          className="h-4 w-4 accent-cyan-500"
+                          className="h-4 w-4 accent-sky-500"
                         />
                       </div>
                     ))
                   )}
                 </div>
-              </div>
+              </section>
             </div>
           )}
 
           {tab === "logs" && (
-            <div className="rounded-xl border border-slate-800 bg-slate-950 p-4 font-mono text-xs text-slate-300">
+            <div className="mx-auto max-w-6xl rounded-xl border border-slate-800 bg-[#0b0f16] p-4 font-mono-tabular text-xs text-slate-300">
               {logs.length === 0 ? (
-                <div className="text-slate-500">暂无运行日志（连接节点后实时展示，敏感口令自动脱敏）。</div>
+                <div className="py-12 text-center text-slate-500">
+                  暂无运行日志（连接节点后自动流式输出，敏感口令自动脱敏）。
+                </div>
               ) : (
                 logs.map((line, i) => (
                   <div
                     key={i}
-                    className={`border-b border-slate-900 py-1 ${
+                    className={`border-b border-slate-900/80 py-1 ${
                       line.includes("unrecognized remote public key")
-                        ? "bg-rose-950/70 text-rose-300"
+                        ? "bg-rose-950/60 text-rose-300"
                         : ""
                     }`}
                   >
@@ -638,34 +1106,41 @@ export default function App() {
           )}
 
           {tab === "settings" && (
-            <div className="max-w-2xl space-y-5 rounded-xl border border-slate-800 bg-slate-900/50 p-6">
+            <div className="mq-panel mx-auto max-w-2xl space-y-5 rounded-xl p-6">
+              <div>
+                <h2 className="text-sm font-semibold text-white">直连防泄漏与本地端口策略</h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  外部 `.conf` 与订阅无法覆盖以下任何安全边界设置。
+                </p>
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-xs font-medium text-slate-400">本地 Mixed 代理端口 (127.0.0.1)</label>
+                  <label className="text-xs text-slate-400">Mixed 代理端口 (127.0.0.1)</label>
                   <input
                     type="number"
                     value={policy.mixed_listen_port}
                     onChange={(e) =>
                       setPolicy({ ...policy, mixed_listen_port: Number(e.target.value) })
                     }
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                   />
                 </div>
                 <div>
-                  <label className="text-xs font-medium text-slate-400">本地 Clash API 端口 (强制随机 Bearer Secret)</label>
+                  <label className="text-xs text-slate-400">Clash API 端口 (随机 32B Bearer)</label>
                   <input
                     type="number"
                     value={policy.clash_api_port}
                     onChange={(e) =>
                       setPolicy({ ...policy, clash_api_port: Number(e.target.value) })
                     }
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="text-xs font-medium text-slate-400">直连场景 IPv6 防旁路泄漏策略</label>
+                <label className="text-xs text-slate-400">IPv6 防旁路泄漏策略</label>
                 <select
                   value={policy.ipv6_mode}
                   onChange={(e) =>
@@ -674,7 +1149,7 @@ export default function App() {
                       ipv6_mode: e.target.value as RuntimePolicy["ipv6_mode"],
                     })
                   }
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                  className="mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                 >
                   <option value="block_to_prevent_leak">
                     屏蔽 IPv6 / AAAA 防泄漏（推荐：IPv4 直连节点零旁路）
@@ -686,110 +1161,146 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-xs font-medium text-slate-400">远端 DoH DNS（强制 detour=proxy）</label>
+                  <label className="text-xs text-slate-400">远端 DoH DNS（强制 detour=proxy）</label>
                   <input
                     value={policy.remote_dns_server}
                     onChange={(e) => setPolicy({ ...policy, remote_dns_server: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                   />
                 </div>
                 <div>
-                  <label className="text-xs font-medium text-slate-400">直连 / 节点域名 Bootstrap DNS</label>
+                  <label className="text-xs text-slate-400">直连 / Bootstrap DNS</label>
                   <input
                     value={policy.direct_dns_server}
                     onChange={(e) => setPolicy({ ...policy, direct_dns_server: e.target.value })}
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                    className="font-mono-tabular mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                   />
                 </div>
               </div>
 
-              <div className="flex items-center justify-between pt-2">
-                <span className="text-xs text-slate-500">
-                  所有外部配置无法覆盖此处端口、API 鉴权与防泄漏策略。
-                </span>
+              <div className="flex justify-end pt-2">
                 <button
-                  onClick={handleSavePolicy}
-                  className="rounded-lg bg-cyan-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400"
+                  onClick={() => applyPolicyChange({}, true)}
+                  className="rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400"
                 >
-                  保存策略
+                  保存并应用策略
                 </button>
               </div>
             </div>
           )}
-        </div>
-      </main>
+        </main>
+      </div>
 
-      {/* Import & Security Quarantine Modal */}
+      {/* Import Modal (Paste / Local .conf / HTTPS Subscription URL) */}
       {importOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs">
+          <div className="mq-panel flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
-              <div className="flex items-center gap-2">
-                <FileWarning className="h-5 w-5 text-cyan-400" />
-                <h2 className="text-sm font-semibold text-white">
-                  安全导入（自动识别分享链 / Shadowrocket .conf / Clash / sing-box）
-                </h2>
-              </div>
+              <h2 className="text-sm font-semibold text-white">安全导入与隔离审计</h2>
               <button onClick={() => setImportOpen(false)} className="text-slate-400 hover:text-white">
-                <X className="h-5 w-5" />
+                <X className="h-4 w-4" />
               </button>
             </div>
 
             <div className="flex-1 space-y-4 overflow-y-auto p-5">
+              {/* 3-mode selector */}
+              <div className="grid grid-cols-3 gap-2 rounded-lg bg-[#090c10] p-1 text-xs">
+                {[
+                  { id: "paste" as ImportMethod, label: "粘贴链接 / 文本", icon: FileText },
+                  { id: "file" as ImportMethod, label: "本地 .conf 文件", icon: Upload },
+                  { id: "url" as ImportMethod, label: "HTTPS 订阅 URL", icon: Link2 },
+                ].map((m) => {
+                  const Icon = m.icon;
+                  return (
+                    <button
+                      key={m.id}
+                      onClick={() => setImportMethod(m.id)}
+                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 font-medium transition ${
+                        importMethod === m.id
+                          ? "bg-[#1a2433] text-white"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Icon className="h-3.5 w-3.5" /> {m.label}
+                    </button>
+                  );
+                })}
+              </div>
+
               <div>
                 <label className="text-xs text-slate-400">配置名称</label>
                 <input
                   value={importName}
                   onChange={(e) => setImportName(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                  className="mt-1 w-full rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-sm text-white"
                 />
               </div>
 
-              <div>
-                <div className="flex items-center justify-between">
-                  <label className="text-xs text-slate-400">
-                    粘贴分享链（可多行）、Base64 订阅内容或 `.conf` 全文
-                  </label>
-                  <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-cyan-300 hover:bg-slate-700">
-                    选择本地 .conf / 文件
-                    <input
-                      type="file"
-                      accept=".conf,.txt,.json,.yaml,.yml"
-                      className="hidden"
-                      onChange={async (e) => {
-                        const file = e.target.files?.[0];
-                        if (!file) return;
-                        const text = await file.text();
-                        setImportText(text);
-                        setImportName(file.name.replace(/\.[^.]+$/, ""));
-                        setPreview(null);
-                      }}
-                    />
-                  </label>
+              {importMethod === "url" && (
+                <div className="flex gap-2">
+                  <input
+                    value={subUrl}
+                    onChange={(e) => setSubUrl(e.target.value)}
+                    placeholder="https://example.com/subscribe (仅允许公网 HTTPS，自动防 SSRF)"
+                    className="font-mono-tabular flex-1 rounded-lg border border-slate-800 bg-[#090c10] px-3 py-2 text-xs text-white"
+                  />
+                  <button
+                    onClick={handleFetchSubUrl}
+                    disabled={busy || !subUrl.trim()}
+                    className="flex items-center gap-1.5 rounded-lg bg-sky-500/20 px-3.5 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:opacity-40"
+                  >
+                    <Download className="h-3.5 w-3.5" /> 拉取并审计
+                  </button>
                 </div>
+              )}
+
+              {importMethod === "file" && (
+                <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-slate-700 bg-[#090c10] py-8 text-xs text-slate-400 hover:border-sky-500/50 hover:text-slate-200">
+                  <Upload className="mb-2 h-6 w-6 text-sky-400" />
+                  <span>点击选择 Shadowrocket `.conf` / Clash `.yaml` / `sing-box` `.json` 文件</span>
+                  <input
+                    type="file"
+                    accept=".conf,.txt,.json,.yaml,.yml"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const text = await file.text();
+                      setImportText(text);
+                      setImportName(file.name.replace(/\.[^.]+$/, ""));
+                      setPreview(null);
+                      const res = await api.previewImport(text);
+                      setPreview(res);
+                      setApprovedHostDomains(new Set());
+                    }}
+                  />
+                </label>
+              )}
+
+              {importMethod === "paste" && (
                 <textarea
-                  rows={6}
+                  rows={5}
                   value={importText}
                   onChange={(e) => {
                     setImportText(e.target.value);
                     setPreview(null);
                   }}
-                  placeholder="trojan://... / anytls://... / hy2://... / [General]..."
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 p-3 font-mono text-xs text-slate-200 outline-none focus:border-cyan-500"
+                  placeholder="trojan://... / anytls://... / hy2://... / tuic://... / vless://..."
+                  className="font-mono-tabular w-full rounded-lg border border-slate-800 bg-[#090c10] p-3 text-xs text-slate-200 outline-none focus:border-sky-500"
                 />
-              </div>
+              )}
 
               {preview && (
-                <div className="space-y-3 rounded-xl border border-slate-800 bg-slate-950/80 p-4">
+                <div className="space-y-3 rounded-xl border border-slate-800 bg-[#090c10] p-4">
                   <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="rounded bg-cyan-500/15 px-2 py-0.5 text-cyan-300">
-                      格式: {preview.format}
+                    <span className="rounded bg-sky-500/15 px-2 py-0.5 text-sky-300">
+                      {preview.format}
                     </span>
                     <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">
-                      节点: {preview.report.total_nodes_imported}
+                      节点 {preview.report.total_nodes_imported}
                     </span>
                     <span className="rounded bg-slate-800 px-2 py-0.5 text-slate-200">
-                      规则: {preview.report.total_rules_imported}
+                      规则 {preview.report.total_rules_imported}
                     </span>
                     {preview.report.stripped_sections.length > 0 && (
                       <span className="rounded bg-rose-500/20 px-2 py-0.5 text-rose-300">
@@ -803,7 +1314,7 @@ export default function App() {
                       key={idx}
                       className={`rounded-lg border p-3 text-xs ${
                         f.severity === "critical" || f.severity === "high"
-                          ? "border-rose-500/40 bg-rose-950/30 text-rose-200"
+                          ? "border-rose-500/35 bg-rose-950/25 text-rose-200"
                           : "border-amber-500/30 bg-amber-950/20 text-amber-200"
                       }`}
                     >
@@ -811,7 +1322,7 @@ export default function App() {
                         [{f.severity.toUpperCase()} · {f.action.toUpperCase()}] {f.summary}
                       </div>
                       {f.samples.length > 0 && (
-                        <div className="mt-1 font-mono text-[11px] opacity-80">
+                        <div className="font-mono-tabular mt-1 text-[11px] opacity-80">
                           {f.samples.slice(0, 3).join(" | ")}
                         </div>
                       )}
@@ -819,16 +1330,16 @@ export default function App() {
                   ))}
 
                   {preview.hosts.length > 0 && (
-                    <div className="space-y-1.5 pt-1">
-                      <div className="text-xs font-semibold text-slate-300">
+                    <div className="space-y-1.5">
+                      <div className="text-xs font-medium text-slate-300">
                         勾选需要放行的 `[Host]` 映射（默认全部隔离）：
                       </div>
                       {preview.hosts.map((h) => (
                         <label
                           key={h.domain}
-                          className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2 text-xs"
+                          className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-800 bg-[#111722] px-3 py-2 text-xs"
                         >
-                          <span className="font-mono">
+                          <span className="font-mono-tabular">
                             {h.domain} → {h.target}{" "}
                             <span className="text-amber-300">({h.classification})</span>
                           </span>
@@ -841,7 +1352,7 @@ export default function App() {
                               else next.delete(h.domain);
                               setApprovedHostDomains(next);
                             }}
-                            className="accent-cyan-500"
+                            className="accent-sky-500"
                           />
                         </label>
                       ))}
@@ -852,19 +1363,21 @@ export default function App() {
             </div>
 
             <div className="flex items-center justify-end gap-2 border-t border-slate-800 px-5 py-3">
-              <button
-                onClick={handlePreviewImport}
-                disabled={busy || !importText.trim()}
-                className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
-              >
-                1. 安全扫描与预览
-              </button>
+              {importMethod === "paste" && (
+                <button
+                  onClick={handlePreviewImport}
+                  disabled={busy || !importText.trim()}
+                  className="rounded-lg border border-slate-700 bg-[#151c27] px-4 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-40"
+                >
+                  1. 安全扫描与预览
+                </button>
+              )}
               <button
                 onClick={handleCommitImport}
                 disabled={busy || !preview}
-                className="rounded-lg bg-cyan-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-40"
+                className="rounded-lg bg-sky-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-40"
               >
-                2. 确认导入到 MaxQ
+                确认导入至 MaxQ
               </button>
             </div>
           </div>
@@ -873,36 +1386,37 @@ export default function App() {
 
       {/* TLS TOFU Probe & Pin Inspector Drawer */}
       {inspectNode && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-xs">
-          <div className="flex h-full w-full max-w-lg flex-col border-l border-slate-800 bg-slate-900 shadow-2xl">
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/65 backdrop-blur-xs">
+          <div className="mq-panel flex h-full w-full max-w-lg flex-col border-y-0 border-r-0 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
               <div>
                 <h2 className="text-sm font-semibold text-white">TLS 证书探测与 TOFU 公钥固定</h2>
                 <p className="text-xs text-slate-400">{inspectNode.name}</p>
               </div>
               <button onClick={() => setInspectNode(null)} className="text-slate-400 hover:text-white">
-                <X className="h-5 w-5" />
+                <X className="h-4 w-4" />
               </button>
             </div>
 
             <div className="flex-1 space-y-4 overflow-y-auto p-5 text-xs">
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-1.5">
+              <div className="space-y-1.5 rounded-xl border border-slate-800 bg-[#090c10] p-4">
                 <div>
-                  <span className="text-slate-400">目标地址：</span>
-                  <span className="font-mono text-slate-200">
-                    {inspectNode.dial_override_server ?? inspectNode.server}:{inspectNode.server_port}
+                  <span className="text-slate-400">拨号地址：</span>
+                  <span className="font-mono-tabular text-slate-200">
+                    {inspectNode.dial_override_server ?? inspectNode.server}:
+                    {inspectNode.server_port}
                   </span>
                 </div>
                 <div>
                   <span className="text-slate-400">TLS SNI：</span>
-                  <span className="font-mono text-slate-200">
+                  <span className="font-mono-tabular text-slate-200">
                     {inspectNode.tls.server_name ?? inspectNode.server}
                   </span>
                 </div>
                 <div>
                   <span className="text-slate-400">探测引擎：</span>
-                  <span className="text-cyan-300">
-                    纯 Rust rustls / quinn（绕过 Windows Schannel，支持自签与 Hysteria2 Salamander）
+                  <span className="text-sky-300">
+                    纯 Rust rustls / quinn（绕过 Windows Schannel，校验私钥签名，支持 Hysteria2 Salamander）
                   </span>
                 </div>
               </div>
@@ -910,7 +1424,7 @@ export default function App() {
               <button
                 onClick={() => handleProbeNode(inspectNode)}
                 disabled={probeLoading}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-50"
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-sky-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
               >
                 <RefreshCw className={`h-4 w-4 ${probeLoading ? "animate-spin" : ""}`} />
                 {probeLoading ? "正在握手并提取服务端证书..." : "立即探测服务端证书指纹"}
@@ -923,13 +1437,13 @@ export default function App() {
               )}
 
               {probeResult && (
-                <div className="space-y-3 rounded-xl border border-slate-800 bg-slate-950/80 p-4">
+                <div className="space-y-3 rounded-xl border border-slate-800 bg-[#090c10] p-4">
                   {probeResult.outcome.status === "mismatch" && (
                     <div className="rounded-lg border border-rose-500 bg-rose-950/70 p-3 text-rose-100">
                       <div className="flex items-center gap-1.5 font-bold text-rose-300">
                         <ShieldAlert className="h-4 w-4" /> 警告：证书公钥指纹发生变更（疑似 MITM）！
                       </div>
-                      <div className="mt-2 font-mono text-[11px] break-all">
+                      <div className="font-mono-tabular mt-2 text-[11px] break-all">
                         <div>预期 SPKI: {probeResult.outcome.expected_spki_b64}</div>
                         <div className="text-rose-300">
                           实测 SPKI: {probeResult.outcome.observed_spki_b64}
@@ -940,11 +1454,11 @@ export default function App() {
 
                   {probeResult.outcome.status === "matched" && (
                     <div className="flex items-center gap-2 rounded-lg bg-emerald-500/15 p-2.5 text-emerald-300">
-                      <CheckCircle2 className="h-4 w-4" /> 指纹与已有记录/导入 pin 完全一致！
+                      <CheckCircle2 className="h-4 w-4" /> 指纹与已有记录 / 导入 pin 完全一致
                     </div>
                   )}
 
-                  <div className="space-y-1.5 font-mono text-[11px] break-all">
+                  <div className="font-mono-tabular space-y-1.5 text-[11px] break-all">
                     <div>
                       <span className="text-slate-400">SPKI SHA-256 (Base64 · sing-box): </span>
                       <span className="text-emerald-300">{probeResult.probed.spki_sha256_b64}</span>
@@ -983,11 +1497,9 @@ export default function App() {
 
               {inspectNode.tls.verify_mode.mode === "insecure_legacy" && (
                 <div className="rounded-xl border border-amber-500/30 bg-amber-950/20 p-4">
-                  <div className="font-semibold text-amber-300">
-                    Scheme A 默认安全策略提示
-                  </div>
+                  <div className="font-semibold text-amber-300">Scheme A 默认安全策略</div>
                   <p className="mt-1 text-slate-400">
-                    强烈建议使用上方「探测并固定证书」消除中间人风险。仅在临时调试且明确知晓风险时，可开启单节点临时不安全放行：
+                    强烈建议使用上方「探测并固定证书」消除中间人风险；仅在临时调试且知晓风险时放行单节点：
                   </p>
                   <label className="mt-3 flex cursor-pointer items-center gap-2 text-amber-200">
                     <input

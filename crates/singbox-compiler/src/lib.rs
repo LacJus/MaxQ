@@ -1,17 +1,35 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use maxq_core_model::{
     GeneralSettings, HostClassification, HostEntry, Hysteria2Obfs, Ipv6Policy, NodeConfig,
-    ProtocolConfig, RuleAction, RuleEntry, RuleMatch, RuntimePolicy, TlsConfig, TlsVerifyMode,
-    TransportConfig,
+    ProtocolConfig, ProxyMode, RoutingMode, RuleAction, RuleEntry, RuleMatch, RuleSource,
+    RuntimePolicy, TlsConfig, TlsVerifyMode, TransportConfig,
 };
 use rand::RngCore;
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 use url::Url;
+
+const BUILTIN_DEFAULT_RULES_CONF: &str = include_str!("../assets/default_rules.conf");
+
+/// Returns MaxQ's built-in sanitized default split-routing rules (8,500+ CN direct / overseas proxy rules),
+/// parsed once and cached for the lifetime of the process.
+pub fn builtin_default_rules() -> &'static [RuleEntry] {
+    static RULES: OnceLock<Vec<RuleEntry>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        maxq_parser::shadowrocket_conf::parse_shadowrocket_conf(BUILTIN_DEFAULT_RULES_CONF)
+            .map(|b| b.rules)
+            .unwrap_or_default()
+    })
+}
+
+pub fn builtin_default_rules_count() -> usize {
+    builtin_default_rules().len()
+}
 
 #[derive(Debug, Error)]
 pub enum CompileError {
@@ -48,6 +66,7 @@ pub struct CompiledConfig {
     pub clash_api_secret: String,
     pub skipped_rules_count: usize,
     pub coalesced_route_rules_count: usize,
+    pub used_builtin_rules: bool,
 }
 
 /// Compiles canonical MaxQ IR into a strictly modern `sing-box v1.14+` JSON configuration
@@ -73,18 +92,33 @@ pub fn compile_singbox_v14(input: &CompileInput<'_>) -> Result<CompiledConfig, C
         return Err(CompileError::UnsafeCorsOrigins);
     }
 
+    // Resolve effective ruleset according to RoutingMode and RuleSource
+    let (effective_rules, used_builtin_rules): (&[RuleEntry], bool) = match input.policy.routing_mode {
+        RoutingMode::Rule => match input.policy.rule_source {
+            RuleSource::BuiltinDefault => (builtin_default_rules(), true),
+            RuleSource::ProfileOrBuiltin => {
+                if input.rules.is_empty() {
+                    (builtin_default_rules(), true)
+                } else {
+                    (input.rules, false)
+                }
+            }
+        },
+        RoutingMode::Global | RoutingMode::Direct => (&[], false),
+    };
+
     // 2. Compile active proxy outbound (enforces Scheme A TLS gate + mandatory TLS!)
     let proxy_outbound = compile_node_outbound(input.active_node, "proxy")?;
 
     // 3. Compile DNS section (v1.12+ typed servers, explicit proxy detour, order-preserving rules)
-    let dns_value = build_dns_section(input);
+    let dns_value = build_dns_section(input, effective_rules);
 
     // 4. Compile inbounds (strictly 127.0.0.1 unless allow_lan, private-CIDR-only TUN exclusions)
     let inbounds = build_inbounds(input);
 
     // 5. Compile route section (v1.11+ rule actions + category-safe order-preserving coalescing)
     let (route_value, skipped_rules_count, coalesced_route_rules_count) =
-        build_route_section(input);
+        build_route_section(input, effective_rules);
 
     let config = json!({
         "log": {
@@ -116,6 +150,7 @@ pub fn compile_singbox_v14(input: &CompileInput<'_>) -> Result<CompiledConfig, C
         clash_api_secret,
         skipped_rules_count,
         coalesced_route_rules_count,
+        used_builtin_rules,
     })
 }
 
@@ -164,7 +199,8 @@ fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
         "listen_port": input.policy.mixed_listen_port
     })];
 
-    if input.policy.tun_enabled {
+    let enable_tun = input.policy.tun_enabled || input.policy.proxy_mode == ProxyMode::Tun;
+    if enable_tun {
         let mut excluded: Vec<String> = vec![
             "127.0.0.0/8".into(),
             "10.0.0.0/8".into(),
@@ -250,7 +286,7 @@ impl DnsDomainBucket {
     }
 }
 
-fn build_dns_section(input: &CompileInput<'_>) -> Value {
+fn build_dns_section(input: &CompileInput<'_>, effective_rules: &[RuleEntry]) -> Value {
     let mut servers = vec![
         // CRITICAL (sing-box v1.12+): typed DoH defaults to DIRECT unless detour is explicit!
         json!({
@@ -300,7 +336,7 @@ fn build_dns_section(input: &CompileInput<'_>) -> Value {
 
     // Order-preserving DNS domain rules so preceding PROXY/REJECT rules are never leaked to dns-direct (H-2)
     let mut dns_bucket = DnsDomainBucket::default();
-    for rule in input.rules {
+    for rule in effective_rules {
         if matches!(rule.matcher, RuleMatch::Final) {
             break;
         }
@@ -329,10 +365,15 @@ fn build_dns_section(input: &CompileInput<'_>) -> Value {
     }
     dns_bucket.flush_into(&mut dns_rules);
 
+    let dns_final = match input.policy.routing_mode {
+        RoutingMode::Direct => "dns-direct",
+        RoutingMode::Rule | RoutingMode::Global => "dns-remote",
+    };
+
     let mut dns_obj = Map::new();
     dns_obj.insert("servers".into(), Value::Array(servers));
     dns_obj.insert("rules".into(), Value::Array(dns_rules));
-    dns_obj.insert("final".into(), json!("dns-remote"));
+    dns_obj.insert("final".into(), json!(dns_final));
     match input.policy.ipv6_mode {
         Ipv6Policy::BlockToPreventLeak => {
             dns_obj.insert("strategy".into(), json!("ipv4_only"));
@@ -428,7 +469,10 @@ fn apply_route_action(obj: &mut Map<String, Value>, action: &RuleAction) {
     }
 }
 
-fn build_route_section(input: &CompileInput<'_>) -> (Value, usize, usize) {
+fn build_route_section(
+    input: &CompileInput<'_>,
+    effective_rules: &[RuleEntry],
+) -> (Value, usize, usize) {
     let mut route_rules = vec![
         json!({ "action": "sniff" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
@@ -442,12 +486,15 @@ fn build_route_section(input: &CompileInput<'_>) -> (Value, usize, usize) {
         }));
     }
 
-    let mut final_outbound = "proxy";
+    let mut final_outbound = match input.policy.routing_mode {
+        RoutingMode::Direct => "direct",
+        RoutingMode::Rule | RoutingMode::Global => "proxy",
+    };
     let mut final_is_reject = false;
     let mut skipped_rules = 0usize;
     let mut bucket = CoalescedRuleBucket::default();
 
-    for rule in input.rules {
+    for rule in effective_rules {
         if matches!(rule.matcher, RuleMatch::Final) {
             match rule.action {
                 RuleAction::Direct => final_outbound = "direct",

@@ -98,14 +98,51 @@ pub struct RuntimePolicy {
     pub clash_api_secret: String,
     /// Allowed CORS origins for Clash API (never `*`).
     pub clash_api_allowed_origins: Vec<String>,
-    /// Enable TUN inbound (requires privileged service on Windows).
+    /// Enable TUN inbound (requires hardened privileged service on Windows).
+    #[serde(default)]
     pub tun_enabled: bool,
+    /// Proxy engine mode: unprivileged System Proxy vs hardened Windows TUN Service.
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
+    /// Traffic routing mode: Rule (split routing), Global (all proxy), or Direct.
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
+    /// Where routing rules come from when `routing_mode == Rule`.
+    #[serde(default)]
+    pub rule_source: RuleSource,
     /// IPv6 handling policy for direct-node anti-leak.
     pub ipv6_mode: Ipv6Policy,
     /// Remote DoH/DoT server routed strictly via `"detour": "proxy"`.
     pub remote_dns_server: String,
     /// Direct/bootstrap DNS server IP (used for proxy hostname resolution & direct rules).
     pub direct_dns_server: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    #[default]
+    SystemProxy,
+    Tun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSource {
+    /// Always use MaxQ's built-in sanitized default split-routing rules (8,500+ CN direct / overseas proxy rules).
+    BuiltinDefault,
+    /// Use imported `.conf` profile rules if non-empty, otherwise automatically apply MaxQ's built-in rules.
+    #[default]
+    ProfileOrBuiltin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -132,6 +169,9 @@ impl Default for RuntimePolicy {
                 "https://tauri.localhost".to_string(),
             ],
             tun_enabled: false,
+            proxy_mode: ProxyMode::SystemProxy,
+            routing_mode: RoutingMode::Rule,
+            rule_source: RuleSource::ProfileOrBuiltin,
             ipv6_mode: Ipv6Policy::BlockToPreventLeak,
             remote_dns_server: "1.1.1.1".to_string(),
             direct_dns_server: "223.5.5.5".to_string(),

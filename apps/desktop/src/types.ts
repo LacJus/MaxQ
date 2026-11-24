@@ -143,6 +143,28 @@ export interface ProbeNodeResult {
   proposed_trust_record: TrustRecord;
 }
 
+export interface BatchPinSummary {
+  probed_endpoints: number;
+  pinned_nodes: number;
+  failed_nodes: number;
+  errors: string[];
+}
+
+export interface BuiltinRulesInfo {
+  rule_count: number;
+  description: string;
+}
+
+export interface TunServiceStatus {
+  installed: boolean;
+  running: boolean;
+  tun_active: boolean;
+  singbox_pid?: number;
+  singbox_sha256_verified: boolean;
+  last_mitm_alert?: string;
+  version?: string;
+}
+
 export interface RuntimeStatus {
   running: boolean;
   pid?: number;
@@ -151,8 +173,13 @@ export interface RuntimeStatus {
   clash_api_port?: number;
   mixed_port?: number;
   system_proxy_enabled: boolean;
+  tun_active: boolean;
   last_mitm_alert?: string;
 }
+
+export type ProxyMode = "system_proxy" | "tun";
+export type RoutingMode = "rule" | "global" | "direct";
+export type RuleSource = "builtin_default" | "profile_or_builtin";
 
 export interface RuntimePolicy {
   mixed_listen_port: number;
@@ -161,6 +188,9 @@ export interface RuntimePolicy {
   clash_api_secret: string;
   clash_api_allowed_origins: string[];
   tun_enabled: boolean;
+  proxy_mode: ProxyMode;
+  routing_mode: RoutingMode;
+  rule_source: RuleSource;
   ipv6_mode: "block_to_prevent_leak" | "prefer_ipv4" | "dual_stack";
   remote_dns_server: string;
   direct_dns_server: string;

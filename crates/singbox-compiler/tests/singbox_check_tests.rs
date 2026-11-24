@@ -252,3 +252,77 @@ fn coalesces_thousands_of_conf_rules_and_approved_host_aliases_and_passes_real_s
 
     verify_with_real_singbox(&compiled.json, "large_conf_5000_rules");
 }
+
+#[test]
+fn builtin_default_rules_and_tun_service_gate_pass_real_singbox_check() {
+    use maxq_core_model::{ProxyMode, RoutingMode};
+    use maxq_singbox_compiler::builtin_default_rules_count;
+
+    let count = builtin_default_rules_count();
+    assert!(
+        count > 8000,
+        "expected >8000 built-in routing rules from default_rules.conf, got {count}"
+    );
+
+    let mut node = NodeConfig::new(
+        "Single Trojan Link",
+        "edge.example.net",
+        8205,
+        ProtocolConfig::Trojan {
+            password: "test-password".into(),
+        },
+    );
+    node.tls.enabled = true;
+    node.tls.server_name = Some("cos.example.com".into());
+    node.tls.verify_mode = TlsVerifyMode::PinnedSpki;
+    node.tls.trust_record = Some(mock_trust_record("cos.example.com"));
+
+    // 1. Single share link (empty profile rules) + TUN mode -> automatically uses built-in 8,581 rules!
+    let mut policy = RuntimePolicy::default();
+    policy.proxy_mode = ProxyMode::Tun;
+    policy.routing_mode = RoutingMode::Rule;
+
+    let compiled_rule = compile_singbox_v14(&CompileInput {
+        active_node: &node,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &policy,
+    })
+    .expect("compile builtin rules + TUN");
+    assert!(compiled_rule.used_builtin_rules);
+    verify_with_real_singbox(&compiled_rule.json, "builtin_rules_tun");
+
+    // Must ALSO pass privileged Windows TUN service secondary validator!
+    let cfg_str = serde_json::to_string(&compiled_rule.json).unwrap();
+    maxq_win_service::validator::validate_service_config(&cfg_str)
+        .expect("compiled TUN config must satisfy hardened win-service validator");
+
+    // 2. Global mode
+    policy.routing_mode = RoutingMode::Global;
+    let compiled_global = compile_singbox_v14(&CompileInput {
+        active_node: &node,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &policy,
+    })
+    .unwrap();
+    assert!(!compiled_global.used_builtin_rules);
+    assert_eq!(compiled_global.json["route"]["final"], serde_json::json!("proxy"));
+    verify_with_real_singbox(&compiled_global.json, "global_mode_tun");
+
+    // 3. Direct mode
+    policy.routing_mode = RoutingMode::Direct;
+    let compiled_direct = compile_singbox_v14(&CompileInput {
+        active_node: &node,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &policy,
+    })
+    .unwrap();
+    assert_eq!(compiled_direct.json["route"]["final"], serde_json::json!("direct"));
+    assert_eq!(compiled_direct.json["dns"]["final"], serde_json::json!("dns-direct"));
+    verify_with_real_singbox(&compiled_direct.json, "direct_mode_tun");
+}

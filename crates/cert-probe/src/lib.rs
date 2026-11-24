@@ -280,6 +280,20 @@ pub async fn probe_certificate(req: &ProbeRequest) -> Result<ProbedCertificate, 
     }
 }
 
+/// Measures TCP handshake RTT in milliseconds to a node's effective dial endpoint.
+pub async fn probe_tcp_latency_ms(host: &str, port: u16, timeout_ms: u64) -> Result<u64, ProbeError> {
+    let dur = Duration::from_millis(timeout_ms.clamp(500, 15_000));
+    let addr = timeout(dur, resolve_target(host, port))
+        .await
+        .map_err(|_| ProbeError::Timeout(dur))??;
+    let started = std::time::Instant::now();
+    timeout(dur, TcpStream::connect(addr))
+        .await
+        .map_err(|_| ProbeError::Timeout(dur))?
+        .map_err(ProbeError::TcpConnect)?;
+    Ok(started.elapsed().as_millis().max(1) as u64)
+}
+
 async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate, ProbeError> {
     let target_addr = resolve_target(&req.host, req.port).await?;
     let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));

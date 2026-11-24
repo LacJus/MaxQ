@@ -8,6 +8,7 @@ members = [
     "crates/singbox-compiler",
     "crates/storage",
     "crates/core-runtime",
+    "crates/win-service",
     "crates/maxq-cli",
 ]
 exclude = ["apps/desktop/src-tauri"]

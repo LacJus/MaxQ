@@ -2,7 +2,7 @@
 
 [package]
 name = "maxq-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -14,10 +14,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 maxq-core-model = { path = "../../../crates/core-model" }
 maxq-parser = { path = "../../../crates/parser" }
 maxq-sanitizer = { path = "../../../crates/sanitizer" }
@@ -25,3 +26,4 @@ maxq-cert-probe = { path = "../../../crates/cert-probe" }
 maxq-singbox-compiler = { path = "../../../crates/singbox-compiler" }
 maxq-storage = { path = "../../../crates/storage" }
 maxq-core-runtime = { path = "../../../crates/core-runtime" }
+maxq-win-service = { path = "../../../crates/win-service" }

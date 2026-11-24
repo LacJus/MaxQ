@@ -2,9 +2,46 @@
 
 :root {
   color-scheme: dark;
+  --mq-bg: #090c10;
+  --mq-surface: #0f141c;
+  --mq-elevated: #151c27;
+  --mq-hover: #1b2432;
+  --mq-border: rgba(148, 163, 184, 0.12);
+  --mq-border-strong: rgba(148, 163, 184, 0.22);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--mq-bg);
+  color: #e6edf3;
+  font-family: "Inter", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-mono-tabular {
+  font-family: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.mq-panel {
+  background-color: var(--mq-surface);
+  border: 1px solid var(--mq-border);
+}
+
+.mq-card {
+  background-color: var(--mq-elevated);
+  border: 1px solid var(--mq-border);
+  transition: border-color 140ms ease, background-color 140ms ease, transform 140ms ease;
+}
+
+.mq-card:hover {
+  border-color: var(--mq-border-strong);
+  background-color: var(--mq-hover);
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(51 65 85) transparent;
+  scrollbar-color: rgba(100, 116, 139, 0.35) transparent;
 }

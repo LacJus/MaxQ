@@ -31,14 +31,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "apps/desktop/src-tauri -> target"
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: pnpm/action-setup@v4
         with:
           version: 10
-      - name: Download sing-box v1.14.4 Windows amd64 sidecar
+      - name: Download & SHA-256 verify sing-box v1.14.4 Windows amd64 sidecar
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources
@@ -46,7 +48,16 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile sing-box.zip
           Expand-Archive -Path sing-box.zip -DestinationPath sb_tmp -Force
           Copy-Item sb_tmp/sing-box-1.14.4-windows-amd64/sing-box.exe apps/desktop/src-tauri/resources/sing-box.exe
-          Get-FileHash apps/desktop/src-tauri/resources/sing-box.exe -Algorithm SHA256
+          $hash = (Get-FileHash apps/desktop/src-tauri/resources/sing-box.exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "sing-box.exe SHA256: $hash"
+          if ($hash -ne "8f30682ee198855440d2a7fe070d5d3653793b2d01bb8c85eea88f93bbe7c8b9") {
+            throw "sing-box.exe SHA-256 verification failed!"
+          }
+      - name: Build hardened Windows TUN service (maxq-service.exe)
+        shell: pwsh
+        run: |
+          cargo build --release -p maxq-win-service --bin maxq-service
+          Copy-Item target/release/maxq-service.exe apps/desktop/src-tauri/resources/maxq-service.exe
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: pnpm install --no-frozen-lockfile

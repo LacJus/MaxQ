@@ -1,4 +1,5 @@
 pub mod system_proxy;
+pub mod tun_client;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,8 @@ pub struct RuntimeStatus {
     pub clash_api_port: Option<u16>,
     pub mixed_port: Option<u16>,
     pub system_proxy_enabled: bool,
+    #[serde(default)]
+    pub tun_active: bool,
     pub last_mitm_alert: Option<String>,
 }
 
@@ -75,6 +78,7 @@ impl Default for RuntimeStatus {
             clash_api_port: None,
             mixed_port: None,
             system_proxy_enabled: false,
+            tun_active: false,
             last_mitm_alert: None,
         }
     }

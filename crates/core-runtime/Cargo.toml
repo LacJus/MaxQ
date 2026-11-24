@@ -8,6 +8,7 @@ license.workspace = true
 maxq-core-model = { path = "../core-model" }
 maxq-cert-probe = { path = "../cert-probe" }
 maxq-singbox-compiler = { path = "../singbox-compiler" }
+maxq-win-service = { path = "../win-service" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -16,4 +17,9 @@ thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
