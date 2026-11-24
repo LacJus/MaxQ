@@ -1,0 +1,15 @@
+[package]
+name = "maxq-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+maxq-core-model = { path = "../core-model" }
+maxq-parser = { path = "../parser" }
+maxq-sanitizer = { path = "../sanitizer" }
+maxq-cert-probe = { path = "../cert-probe" }
+maxq-singbox-compiler = { path = "../singbox-compiler" }
+tokio.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

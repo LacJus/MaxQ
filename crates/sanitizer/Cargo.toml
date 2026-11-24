@@ -1,0 +1,9 @@
+[package]
+name = "maxq-sanitizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+maxq-core-model = { path = "../core-model" }
+url.workspace = true

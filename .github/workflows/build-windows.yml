@@ -1,0 +1,60 @@
+name: Build MaxQ (Windows & Core Tests)
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-tests-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install sing-box v1.14.4 Linux validator
+        run: |
+          mkdir -p /home/runner/.local/bin
+          curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          mv /tmp/sing-box-1.14.4-linux-amd64/sing-box /home/runner/.local/bin/sing-box
+          chmod +x /home/runner/.local/bin/sing-box
+      - name: Run full Rust workspace test suite
+        run: cargo test --workspace
+
+  build-windows:
+    runs-on: windows-latest
+    needs: core-tests-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Download sing-box v1.14.4 Windows amd64 sidecar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources
+          $url = "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile sing-box.zip
+          Expand-Archive -Path sing-box.zip -DestinationPath sb_tmp -Force
+          Copy-Item sb_tmp/sing-box-1.14.4-windows-amd64/sing-box.exe apps/desktop/src-tauri/resources/sing-box.exe
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install
+      - name: Build Tauri v2 Windows installers (NSIS & MSI)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: maxq-windows-amd64
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            apps/desktop/src-tauri/target/release/bundle/msi/*.msi

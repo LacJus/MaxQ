@@ -1,0 +1,19 @@
+[package]
+name = "maxq-core-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+maxq-core-model = { path = "../core-model" }
+maxq-cert-probe = { path = "../cert-probe" }
+maxq-singbox-compiler = { path = "../singbox-compiler" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
