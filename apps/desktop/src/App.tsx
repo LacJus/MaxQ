@@ -143,14 +143,14 @@ function tlsBadge(node: NodeConfig) {
 
 const DEFAULT_ABOUT: AboutInfo = {
   app_name: "MaxQ",
-  app_version: "0.3.0",
+  app_version: "0.3.1",
   engine_brand: "JaxCore · sing-box",
   core_version: "1.14.4",
   creator: "JucStudio · Neon",
   os: "windows",
   arch: "x86_64",
   builtin_rule_count: 8581,
-  service_protocol_version: "1.0.1",
+  service_protocol_version: "1.0.2",
   total_profiles: 0,
   total_nodes: 0,
   pinned_spki_nodes: 0,
