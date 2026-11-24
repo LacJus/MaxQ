@@ -66,29 +66,61 @@ fn get_builtin_rules_info() -> BuiltinRulesInfo {
 }
 
 #[tauri::command]
-fn get_tun_service_status() -> TunServiceStatus {
-    TunServiceClient::query_status()
+async fn get_tun_service_status() -> TunServiceStatus {
+    tokio::task::spawn_blocking(TunServiceClient::query_status)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-fn install_tun_service(state: State<'_, AppState>) -> Result<String, String> {
+async fn install_tun_service(state: State<'_, AppState>) -> Result<String, String> {
     let exe = state
         .service_exe_path
-        .as_ref()
-        .ok_or_else(|| "未找到已打包的绝对路径 maxq-service.exe，请通过官方安装包安装 MaxQ。".to_string())?;
-    TunServiceClient::install_elevated(exe).map_err(|e| e.to_string())?;
-    Ok("已触发 UAC 提权安装 MaxQ 安全加固 TUN 服务，请稍候 2 秒刷新状态。".into())
+        .clone()
+        .ok_or_else(|| {
+            "未找到已打包的绝对路径 maxq-service.exe，请通过官方安装包安装 MaxQ。".to_string()
+        })?;
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        TunServiceClient::install_elevated(&exe).map_err(|e| e.to_string())?;
+
+        // Poll up to 4s for Named Pipe IPC to confirm service is live and authenticated
+        let mut last_status = TunServiceStatus::default();
+        for _ in 0..14 {
+            last_status = TunServiceClient::query_status();
+            if last_status.running {
+                return Ok(if last_status.singbox_sha256_verified {
+                    "MaxQ 安全加固 TUN 服务已安装并运行（sing-box SHA-256 校验通过）".into()
+                } else {
+                    "MaxQ TUN 服务已运行，但 sing-box.exe SHA-256 校验未通过，请重新安装官方安装包。".into()
+                });
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        let detail = last_status
+            .last_error
+            .unwrap_or_else(|| "服务未响应 Named Pipe IPC 握手".to_string());
+        Err(format!("TUN 服务安装流程已结束但未能就绪：{detail}"))
+    })
+    .await
+    .map_err(|e| format!("后台安装任务异常: {e}"))?
 }
 
 #[tauri::command]
-fn uninstall_tun_service(state: State<'_, AppState>) -> Result<String, String> {
-    let _ = TunServiceClient::stop_tun();
+async fn uninstall_tun_service(state: State<'_, AppState>) -> Result<String, String> {
     let exe = state
         .service_exe_path
-        .as_ref()
+        .clone()
         .ok_or_else(|| "未找到已打包的绝对路径 maxq-service.exe。".to_string())?;
-    TunServiceClient::uninstall_elevated(exe).map_err(|e| e.to_string())?;
-    Ok("已触发 UAC 提权卸载 MaxQ TUN 服务。".into())
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let _ = TunServiceClient::stop_tun();
+        TunServiceClient::uninstall_elevated(&exe).map_err(|e| e.to_string())?;
+        Ok("已停止并卸载 MaxQ TUN 服务。".into())
+    })
+    .await
+    .map_err(|e| format!("后台卸载任务异常: {e}"))?
 }
 
 #[tauri::command]
@@ -452,11 +484,14 @@ async fn start_proxy(
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
         let _ = sp.disable_and_restore();
     }
-    let _ = TunServiceClient::stop_tun();
+    let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
 
     if use_tun {
         let cfg_json = serde_json::to_string(&compiled.json).map_err(|e| e.to_string())?;
-        let pid = TunServiceClient::start_tun(cfg_json).map_err(|e| e.to_string())?;
+        let pid = tokio::task::spawn_blocking(move || TunServiceClient::start_tun(cfg_json))
+            .await
+            .map_err(|e| format!("TUN 启动任务异常: {e}"))?
+            .map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.tun_active_node.lock() {
             *guard = Some((node.id.clone(), node.name.clone()));
         }
@@ -504,7 +539,7 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
         let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
         let _ = sp.disable_and_restore();
     }
-    let _ = TunServiceClient::stop_tun();
+    let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
     }
@@ -518,7 +553,9 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
 
 #[tauri::command]
 async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    let tun_st = TunServiceClient::query_status();
+    let tun_st = tokio::task::spawn_blocking(TunServiceClient::query_status)
+        .await
+        .unwrap_or_default();
     if tun_st.tun_active {
         let (nid, nname) = state
             .tun_active_node
@@ -550,9 +587,19 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
 
 #[tauri::command]
 async fn get_runtime_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let tun_st = TunServiceClient::query_status();
-    if tun_st.tun_active {
-        return Ok(TunServiceClient::get_logs());
+    let tun_logs = tokio::task::spawn_blocking(|| {
+        let st = TunServiceClient::query_status();
+        if st.tun_active {
+            Some(TunServiceClient::get_logs())
+        } else {
+            None
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(lines) = tun_logs {
+        return Ok(lines);
     }
     let sup = state.supervisor.lock().await;
     Ok(sup.recent_logs())

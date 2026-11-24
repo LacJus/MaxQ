@@ -163,6 +163,7 @@ export interface TunServiceStatus {
   singbox_sha256_verified: boolean;
   last_mitm_alert?: string;
   version?: string;
+  last_error?: string;
 }
 
 export interface RuntimeStatus {

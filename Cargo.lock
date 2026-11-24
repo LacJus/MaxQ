@@ -628,7 +628,6 @@ name = "maxq-core-runtime"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "maxq-cert-probe",
  "maxq-core-model",
  "maxq-singbox-compiler",
  "maxq-win-service",
@@ -700,7 +699,6 @@ name = "maxq-win-service"
 version = "0.1.0"
 dependencies = [
  "hex",
- "maxq-cert-probe",
  "serde",
  "serde_json",
  "sha2",

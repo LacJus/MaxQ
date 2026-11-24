@@ -7,8 +7,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use maxq_cert_probe::detect_singbox_log_pin_mismatch;
 use maxq_singbox_compiler::CompiledConfig;
+use maxq_win_service::protocol::detect_singbox_log_pin_mismatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};

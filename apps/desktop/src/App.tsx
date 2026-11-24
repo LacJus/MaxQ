@@ -160,6 +160,7 @@ export default function App() {
   const [protoFilter, setProtoFilter] = useState("all");
   const [latencies, setLatencies] = useState<Record<string, number | "err" | "loading">>({});
   const [batchPinning, setBatchPinning] = useState(false);
+  const [tunBusy, setTunBusy] = useState(false);
   const [toast, setToast] = useState<{ kind: "info" | "ok" | "err"; text: string } | null>(null);
 
   // Import modal state
@@ -294,31 +295,37 @@ export default function App() {
   };
 
   const handleInstallTunService = async () => {
+    if (tunBusy) return;
+    setTunBusy(true);
+    showToast("info", "正在请求 UAC 提权并安装启动 MaxQ 安全加固 TUN 服务...");
     try {
       const msg = await api.installTunService();
-      showToast("info", msg);
-      setTimeout(async () => {
-        const st = await api.getTunServiceStatus();
-        setTunService(st);
-        if (st.running) {
-          showToast("ok", "MaxQ 安全加固 TUN 服务已安装并运行（SHA-256 校验通过）");
-        }
-      }, 2500);
+      const st = await api.getTunServiceStatus();
+      setTunService(st);
+      showToast(st.running ? "ok" : "info", msg);
     } catch (err) {
+      const st = await api.getTunServiceStatus().catch(() => null);
+      if (st) setTunService(st);
       showToast("err", String(err));
+    } finally {
+      setTunBusy(false);
     }
   };
 
   const handleUninstallTunService = async () => {
+    if (tunBusy) return;
+    setTunBusy(true);
+    showToast("info", "正在请求 UAC 提权卸载 MaxQ TUN 服务...");
     try {
       const msg = await api.uninstallTunService();
-      showToast("info", msg);
       await applyPolicyChange({ proxy_mode: "system_proxy", tun_enabled: false }, false);
-      setTimeout(async () => {
-        setTunService(await api.getTunServiceStatus());
-      }, 2000);
+      const st = await api.getTunServiceStatus();
+      setTunService(st);
+      showToast("ok", msg);
     } catch (err) {
       showToast("err", String(err));
+    } finally {
+      setTunBusy(false);
     }
   };
 
@@ -663,9 +670,11 @@ export default function App() {
             {!tunService.running && inTauri && (
               <button
                 onClick={handleInstallTunService}
-                className="flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#151c27] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/40 hover:text-sky-300"
+                disabled={tunBusy}
+                className="flex items-center gap-1.5 rounded-lg border border-slate-700/80 bg-[#151c27] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/40 hover:text-sky-300 disabled:opacity-50"
               >
-                <Cpu className="h-3.5 w-3.5" /> 安装 TUN 服务 (UAC)
+                <Cpu className="h-3.5 w-3.5" />{" "}
+                {tunBusy ? "安装 TUN 服务中..." : "安装 TUN 服务 (UAC)"}
               </button>
             )}
             <button
@@ -895,10 +904,16 @@ export default function App() {
                         className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
                           tunService.running
                             ? "bg-emerald-500/15 text-emerald-300"
+                            : tunService.installed
+                            ? "bg-amber-500/15 text-amber-300"
                             : "bg-slate-800 text-slate-400"
                         }`}
                       >
-                        {tunService.running ? "服务运行中" : "未安装 / 未运行"}
+                        {tunService.running
+                          ? "服务运行中"
+                          : tunService.installed
+                          ? "已安装 · 未运行"
+                          : "未安装"}
                       </span>
                     </div>
                     <p className="mt-1.5 text-xs text-slate-400">
@@ -910,27 +925,41 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={async () => setTunService(await api.getTunServiceStatus())}
-                      className="rounded-lg border border-slate-700 bg-[#151c27] px-3 py-1.5 text-xs text-slate-300 hover:text-white"
+                      disabled={tunBusy}
+                      className="rounded-lg border border-slate-700 bg-[#151c27] px-3 py-1.5 text-xs text-slate-300 hover:text-white disabled:opacity-50"
                     >
                       刷新
                     </button>
                     {!tunService.running ? (
                       <button
                         onClick={handleInstallTunService}
-                        className="rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400"
+                        disabled={tunBusy}
+                        className="rounded-lg bg-sky-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
                       >
-                        安装并启动 TUN 服务 (UAC)
+                        {tunBusy
+                          ? "安装/启动中（等待 UAC）..."
+                          : tunService.installed
+                          ? "修复并启动 TUN 服务 (UAC)"
+                          : "安装并启动 TUN 服务 (UAC)"}
                       </button>
                     ) : (
                       <button
                         onClick={handleUninstallTunService}
-                        className="rounded-lg bg-rose-500/15 px-3.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25"
+                        disabled={tunBusy}
+                        className="rounded-lg bg-rose-500/15 px-3.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25 disabled:opacity-50"
                       >
-                        卸载 TUN 服务 (UAC)
+                        {tunBusy ? "卸载中..." : "卸载 TUN 服务 (UAC)"}
                       </button>
                     )}
                   </div>
                 </div>
+
+                {tunService.last_error && !tunService.running && (
+                  <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-200">
+                    <span className="font-semibold text-amber-300">TUN 服务诊断：</span>
+                    <span className="font-mono-tabular break-all">{tunService.last_error}</span>
+                  </div>
+                )}
 
                 <div className="mt-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
                   {[

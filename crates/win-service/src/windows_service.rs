@@ -1,18 +1,16 @@
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use maxq_cert_probe::detect_singbox_log_pin_mismatch;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -20,25 +18,30 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    PIPE_ACCESS_DUPLEX,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, OpenProcess, QueryFullProcessImageNameW, ResetEvent, SetEvent,
+    WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::protocol::{
-    ServiceRequest, ServiceResponse, TunServiceStatus, NAMED_PIPE_PATH, PIPE_SDDL,
-    SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_PROTOCOL_VERSION,
-    SING_BOX_V14_4_WIN64_SHA256,
+    ServiceRequest, ServiceResponse, TunServiceStatus, DIAGNOSTIC_STATUS_FILE,
+    DIAGNOSTIC_STATUS_SUBDIR, NAMED_PIPE_PATH, PIPE_SDDL, SERVICE_DESCRIPTION,
+    SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_PROTOCOL_VERSION, SING_BOX_V14_4_WIN64_SHA256,
 };
 use crate::validator::{
     is_authorized_caller_image, validate_service_config, verify_binary_sha256, MAX_CONFIG_BYTES,
@@ -48,6 +51,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SDDL_REVISION_1: u32 = 1;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const MAX_LOGS: usize = 400;
+const PIPE_IO_TIMEOUT_MS: u32 = 10_000;
 
 struct ServiceRuntimeState {
     child: Option<Child>,
@@ -89,36 +93,61 @@ impl ServiceRuntimeState {
 }
 
 pub fn install_and_start_service() -> Result<(), String> {
+    let res = install_and_start_service_inner();
+    match &res {
+        Ok(()) => write_diagnostic_status("OK: MaxQTunService installed and running"),
+        Err(err) => write_diagnostic_status(&format!("INSTALL_ERROR: {err}")),
+    }
+    res
+}
+
+fn install_and_start_service_inner() -> Result<(), String> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CREATE_SERVICE | ServiceManagerAccess::CONNECT,
     )
-    .map_err(|e| format!("open SCM failed (admin required): {e}"))?;
+    .map_err(|e| format!("打开 Windows 服务管理器失败（需要管理员权限）: {e}"))?;
 
-    let src_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let src_exe = strip_verbatim_prefix(
+        std::env::current_exe().map_err(|e| format!("无法获取当前服务路径: {e}"))?,
+    );
     let src_dir = src_exe
         .parent()
         .ok_or_else(|| "cannot resolve service binary directory".to_string())?;
     let src_singbox = src_dir.join("sing-box.exe");
+    if !src_singbox.exists() {
+        return Err(format!(
+            "未在同目录找到 sing-box.exe: {}",
+            src_singbox.display()
+        ));
+    }
 
     // Stage service + sing-box binaries into SYSTEM/Admin-only directory
     let bin_dir = ensure_system_only_dir("service-bin")?;
     let staged_service = bin_dir.join("maxq-service.exe");
     let staged_singbox = bin_dir.join("sing-box.exe");
 
-    // Stop existing service before replacing staged binaries
-    if let Ok(existing) = manager.open_service(SERVICE_NAME, ServiceAccess::STOP) {
+    // Stop existing service and wait until fully Stopped so staged binaries are unlocked
+    if let Ok(existing) =
+        manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+    {
         let _ = existing.stop();
-        std::thread::sleep(Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if let Ok(st) = existing.query_status() {
+                if st.current_state == ServiceState::Stopped {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
-    if src_exe != staged_service {
-        std::fs::copy(&src_exe, &staged_service)
-            .map_err(|e| format!("failed to stage maxq-service.exe: {e}"))?;
+    if !paths_equal_ci(&src_exe, &staged_service) {
+        copy_with_retry(&src_exe, &staged_service, "maxq-service.exe")?;
     }
-    if src_singbox != staged_singbox {
-        std::fs::copy(&src_singbox, &staged_singbox)
-            .map_err(|e| format!("failed to stage sing-box.exe: {e}"))?;
+    if !paths_equal_ci(&src_singbox, &staged_singbox) {
+        copy_with_retry(&src_singbox, &staged_singbox, "sing-box.exe")?;
     }
 
     // Verify SHA-256 AFTER copying into SYSTEM-only directory to defeat TOCTOU swap (C-4)
@@ -139,7 +168,7 @@ pub fn install_and_start_service() -> Result<(), String> {
     };
     let meta_path = bin_dir.join("authorized-gui-dir.txt");
     std::fs::write(&meta_path, gui_root.to_string_lossy().as_bytes())
-        .map_err(|e| format!("failed to write authorized-gui-dir.txt: {e}"))?;
+        .map_err(|e| format!("写入 authorized-gui-dir.txt 失败: {e}"))?;
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -161,7 +190,7 @@ pub fn install_and_start_service() -> Result<(), String> {
         Ok(existing) => {
             existing
                 .change_config(&service_info)
-                .map_err(|e| format!("update existing service failed: {e}"))?;
+                .map_err(|e| format!("更新现有服务配置失败: {e}"))?;
             existing
         }
         Err(_) => manager
@@ -169,7 +198,7 @@ pub fn install_and_start_service() -> Result<(), String> {
                 &service_info,
                 ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
             )
-            .map_err(|e| format!("create service failed: {e}"))?,
+            .map_err(|e| format!("注册 Windows 服务失败: {e}"))?,
     };
 
     let _ = service.set_description(SERVICE_DESCRIPTION);
@@ -178,14 +207,47 @@ pub fn install_and_start_service() -> Result<(), String> {
     if status.current_state != ServiceState::Running {
         service
             .start::<&OsStr>(&[])
-            .map_err(|e| format!("start service failed: {e}"))?;
+            .map_err(|e| format!("启动 MaxQTunService 失败: {e}"))?;
+
+        // Wait up to 10s for SCM to confirm Running state
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = service.query_status().map_err(|e| e.to_string())?;
+            match st.current_state {
+                ServiceState::Running => break,
+                ServiceState::Stopped => {
+                    return Err(format!(
+                        "MaxQTunService 启动后立即退出（exit_code={:?}）",
+                        st.exit_code
+                    ));
+                }
+                _ => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "等待 MaxQTunService 启动超时（当前状态={:?}）",
+                            st.current_state
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
     }
     Ok(())
 }
 
 pub fn stop_and_uninstall_service() -> Result<(), String> {
+    let res = stop_and_uninstall_service_inner();
+    match &res {
+        Ok(()) => write_diagnostic_status("OK: MaxQTunService uninstalled"),
+        Err(err) => write_diagnostic_status(&format!("UNINSTALL_ERROR: {err}")),
+    }
+    res
+}
+
+fn stop_and_uninstall_service_inner() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(|e| format!("open SCM failed (admin required): {e}"))?;
+        .map_err(|e| format!("打开服务管理器失败（需要管理员权限）: {e}"))?;
     let service = match manager.open_service(
         SERVICE_NAME,
         ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
@@ -194,10 +256,18 @@ pub fn stop_and_uninstall_service() -> Result<(), String> {
         Err(_) => return Ok(()),
     };
     let _ = service.stop();
-    std::thread::sleep(Duration::from_millis(600));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Ok(st) = service.query_status() {
+            if st.current_state == ServiceState::Stopped {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     service
         .delete()
-        .map_err(|e| format!("delete service failed: {e}"))?;
+        .map_err(|e| format!("删除 MaxQTunService 失败: {e}"))?;
     Ok(())
 }
 
@@ -209,7 +279,9 @@ pub fn run_service_dispatcher() -> Result<(), String> {
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_arguments: Vec<OsString>) {
-    let _ = run_service_loop();
+    if let Err(err) = run_service_loop() {
+        write_diagnostic_status(&format!("SERVICE_ERROR: {err}"));
+    }
 }
 
 fn run_service_loop() -> Result<(), String> {
@@ -218,11 +290,18 @@ fn run_service_loop() -> Result<(), String> {
     let runtime = Arc::new(Mutex::new(ServiceRuntimeState::new()));
     let runtime_for_handler = Arc::clone(&runtime);
 
-    // Create ONE persistent Named Pipe with FILE_FLAG_FIRST_PIPE_INSTANCE (defeats pipe squatting! H-1)
-    let pipe = create_hardened_named_pipe()?;
-    let pipe_raw_addr = Arc::new(AtomicUsize::new(pipe as usize));
-    let pipe_for_handler = Arc::clone(&pipe_raw_addr);
+    // Manual-reset stop event signaled by SCM Stop/Shutdown for instant race-free pipe wake
+    let stop_event = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if stop_event.is_null() {
+        return Err(format!(
+            "CreateEventW(stop_event) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stop_event_addr = Arc::new(AtomicUsize::new(stop_event as usize));
+    let stop_event_for_handler = Arc::clone(&stop_event_addr);
 
+    // Register SCM control handler FIRST so startup failures cleanly report ServiceState::Stopped
     let status_handle =
         service_control_handler::register(SERVICE_NAME, move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
@@ -230,11 +309,10 @@ fn run_service_loop() -> Result<(), String> {
                 if let Ok(mut rt) = runtime_for_handler.lock() {
                     rt.stop_singbox();
                 }
-                // Cancel blocking ConnectNamedPipe cleanly without LocalSystem self-connecting (H-1)
-                let raw = pipe_for_handler.load(Ordering::Acquire);
-                if raw != 0 {
+                let ev = stop_event_for_handler.load(Ordering::Acquire);
+                if ev != 0 {
                     unsafe {
-                        CancelIoEx(raw as HANDLE, null());
+                        SetEvent(ev as HANDLE);
                     }
                 }
                 ServiceControlHandlerResult::NoError
@@ -242,7 +320,46 @@ fn run_service_loop() -> Result<(), String> {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("register SCM handler failed: {e}"))?;
+
+    let init_result = (|| -> Result<(HANDLE, HANDLE, PathBuf, PathBuf), String> {
+        let pipe = create_hardened_named_pipe()?;
+        let connect_event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        if connect_event.is_null() {
+            unsafe {
+                CloseHandle(pipe);
+            }
+            return Err(format!(
+                "CreateEventW(connect_event) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let service_exe = strip_verbatim_prefix(
+            std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?,
+        );
+        let runtime_dir = ensure_system_only_dir("service-runtime")?;
+        Ok((pipe, connect_event, service_exe, runtime_dir))
+    })();
+
+    let (pipe, connect_event, service_exe, runtime_dir) = match init_result {
+        Ok(v) => v,
+        Err(err) => {
+            stop_event_addr.store(0, Ordering::Release);
+            unsafe {
+                CloseHandle(stop_event);
+            }
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
+            return Err(err);
+        }
+    };
 
     status_handle
         .set_service_status(ServiceStatus {
@@ -254,18 +371,47 @@ fn run_service_loop() -> Result<(), String> {
             wait_hint: Duration::default(),
             process_id: None,
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("set ServiceState::Running failed: {e}"))?;
 
-    let service_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let runtime_dir = ensure_system_only_dir("service-runtime")?;
+    write_diagnostic_status("OK: MaxQTunService running and listening on Named Pipe");
 
     while !stop_flag.load(Ordering::SeqCst) {
-        let connected = unsafe { ConnectNamedPipe(pipe, null_mut()) } != 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(535); // ERROR_PIPE_CONNECTED
+        unsafe {
+            ResetEvent(connect_event);
+        }
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = connect_event;
+
+        let ok = unsafe { ConnectNamedPipe(pipe, &mut ov) };
+        let connected = if ok != 0 {
+            true
+        } else {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            if err == ERROR_PIPE_CONNECTED {
+                true
+            } else if err == ERROR_IO_PENDING {
+                let handles = [connect_event, stop_event];
+                let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+                if wait == WAIT_OBJECT_0 {
+                    let mut transferred = 0u32;
+                    unsafe { GetOverlappedResult(pipe, &ov, &mut transferred, 0) != 0 }
+                } else {
+                    unsafe {
+                        CancelIoEx(pipe, &ov);
+                    }
+                    false
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(50));
+                false
+            }
+        };
 
         if stop_flag.load(Ordering::SeqCst) {
-            unsafe {
-                DisconnectNamedPipe(pipe);
+            if connected {
+                unsafe {
+                    DisconnectNamedPipe(pipe);
+                }
             }
             break;
         }
@@ -276,14 +422,14 @@ fn run_service_loop() -> Result<(), String> {
                 FlushFileBuffers(pipe);
                 DisconnectNamedPipe(pipe);
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
-    pipe_raw_addr.store(0, Ordering::Release);
+    stop_event_addr.store(0, Ordering::Release);
     unsafe {
+        CloseHandle(connect_event);
         CloseHandle(pipe);
+        CloseHandle(stop_event);
     }
 
     if let Ok(mut rt) = runtime.lock() {
@@ -307,6 +453,37 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
+fn paths_equal_ci(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .eq_ignore_ascii_case(b.to_string_lossy().trim_start_matches(r"\\?\"))
+}
+
+fn copy_with_retry(src: &Path, dst: &Path, label: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..5 {
+        match std::fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = format!("复制 {label} 到 {} 失败: {e}", dst.display());
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 fn create_hardened_named_pipe() -> Result<HANDLE, String> {
     let pipe_name = to_wide_null(NAMED_PIPE_PATH);
     let sddl_wide = to_wide_null(PIPE_SDDL);
@@ -321,7 +498,10 @@ fn create_hardened_named_pipe() -> Result<HANDLE, String> {
         )
     };
     if ok == 0 || sd_ptr.is_null() {
-        return Err("failed to build SDDL security descriptor for Named Pipe".into());
+        return Err(format!(
+            "failed to build SDDL security descriptor for Named Pipe: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     let mut sa = SECURITY_ATTRIBUTES {
@@ -333,7 +513,7 @@ fn create_hardened_named_pipe() -> Result<HANDLE, String> {
     let handle = unsafe {
         CreateNamedPipeW(
             pipe_name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             64 * 1024,
@@ -395,45 +575,153 @@ fn verify_pipe_caller_process(pipe: HANDLE, service_exe: &Path) -> Result<(), St
     Err(format!("unauthorized IPC caller rejected: {caller_str}"))
 }
 
+fn read_pipe_line_overlapped(pipe: HANDLE, max_bytes: usize) -> Result<String, String> {
+    let io_event = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if io_event.is_null() {
+        return Err("CreateEventW(read) failed".into());
+    }
+    let mut acc = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+
+    let res = loop {
+        unsafe {
+            ResetEvent(io_event);
+        }
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = io_event;
+        let mut bytes_read = 0u32;
+
+        let ok = unsafe {
+            ReadFile(
+                pipe,
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                &mut bytes_read,
+                &mut ov,
+            )
+        };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            if err == ERROR_IO_PENDING {
+                let wait = unsafe { WaitForSingleObject(io_event, PIPE_IO_TIMEOUT_MS) };
+                if wait != WAIT_OBJECT_0 {
+                    unsafe {
+                        CancelIoEx(pipe, &ov);
+                    }
+                    break Err("IPC read timeout".into());
+                }
+                if unsafe { GetOverlappedResult(pipe, &ov, &mut bytes_read, 0) } == 0 {
+                    break Err("IPC read failed".into());
+                }
+            } else {
+                break Err(format!("IPC ReadFile error {err}"));
+            }
+        }
+
+        if bytes_read == 0 {
+            break Ok(());
+        }
+        let slice = &chunk[..bytes_read as usize];
+        if let Some(pos) = slice.iter().position(|&b| b == b'\n') {
+            if acc.len() + pos > max_bytes {
+                break Err("IPC request exceeded maximum allowed size".into());
+            }
+            acc.extend_from_slice(&slice[..pos]);
+            break Ok(());
+        }
+        if acc.len() + slice.len() > max_bytes {
+            break Err("IPC request exceeded maximum allowed size".into());
+        }
+        acc.extend_from_slice(slice);
+    };
+
+    unsafe {
+        CloseHandle(io_event);
+    }
+    res?;
+    String::from_utf8(acc).map_err(|_| "IPC request is not valid UTF-8".into())
+}
+
+fn write_pipe_line_overlapped(pipe: HANDLE, line: &str) {
+    let io_event = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if io_event.is_null() {
+        return;
+    }
+    let mut payload = Vec::with_capacity(line.len() + 1);
+    payload.extend_from_slice(line.as_bytes());
+    payload.push(b'\n');
+
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        unsafe {
+            ResetEvent(io_event);
+        }
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = io_event;
+        let mut written = 0u32;
+        let rem = &payload[offset..];
+        let to_write = rem.len().min(64 * 1024) as u32;
+
+        let ok = unsafe { WriteFile(pipe, rem.as_ptr(), to_write, &mut written, &mut ov) };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            if err == ERROR_IO_PENDING {
+                let wait = unsafe { WaitForSingleObject(io_event, PIPE_IO_TIMEOUT_MS) };
+                if wait != WAIT_OBJECT_0 {
+                    unsafe {
+                        CancelIoEx(pipe, &ov);
+                    }
+                    break;
+                }
+                if unsafe { GetOverlappedResult(pipe, &ov, &mut written, 0) } == 0 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if written == 0 {
+            break;
+        }
+        offset += written as usize;
+    }
+
+    unsafe {
+        CloseHandle(io_event);
+    }
+}
+
+fn send_pipe_response(pipe: HANDLE, resp: &ServiceResponse) {
+    if let Ok(encoded) = serde_json::to_string(resp) {
+        write_pipe_line_overlapped(pipe, &encoded);
+    }
+}
+
 fn handle_pipe_client(
     pipe: HANDLE,
     service_exe: &Path,
     runtime_dir: &Path,
     runtime: &Arc<Mutex<ServiceRuntimeState>>,
 ) {
-    let mut file =
-        unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_handle(pipe as RawHandle)) };
-
     if let Err(msg) = verify_pipe_caller_process(pipe, service_exe) {
-        let resp = ServiceResponse::Error { message: msg };
-        let _ = writeln!(
-            &mut *file,
-            "{}",
-            serde_json::to_string(&resp).unwrap_or_default()
-        );
+        send_pipe_response(pipe, &ServiceResponse::Error { message: msg });
         return;
     }
 
-    // Bounded read_line (MAX_CONFIG_BYTES + 64 KiB) to prevent OOM DoS (M-1)
-    let mut line = String::new();
-    {
-        let limited = (&*file).take((MAX_CONFIG_BYTES + 65536) as u64);
-        let mut reader = BufReader::new(limited);
-        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-            return;
-        }
-    }
+    // Bounded overlapped read with 10s timeout (blocks OOM & hung-client DoS)
+    let line = match read_pipe_line_overlapped(pipe, MAX_CONFIG_BYTES + 65536) {
+        Ok(l) if !l.trim().is_empty() => l,
+        _ => return,
+    };
 
     let req: ServiceRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            let resp = ServiceResponse::Error {
-                message: format!("invalid IPC request: {e}"),
-            };
-            let _ = writeln!(
-                &mut *file,
-                "{}",
-                serde_json::to_string(&resp).unwrap_or_default()
+            send_pipe_response(
+                pipe,
+                &ServiceResponse::Error {
+                    message: format!("invalid IPC request: {e}"),
+                },
             );
             return;
         }
@@ -469,6 +757,7 @@ fn handle_pipe_client(
                 singbox_sha256_verified: verified,
                 last_mitm_alert: last_alert,
                 version: Some(SERVICE_PROTOCOL_VERSION.to_string()),
+                last_error: None,
             })
         }
         ServiceRequest::StopTun => {
@@ -495,9 +784,7 @@ fn handle_pipe_client(
         }
     };
 
-    if let Ok(encoded) = serde_json::to_string(&resp) {
-        let _ = writeln!(&mut *file, "{encoded}");
-    }
+    send_pipe_response(pipe, &resp);
 }
 
 fn start_hardened_singbox_tun(
@@ -512,6 +799,9 @@ fn start_hardened_singbox_tun(
     let (logs_arc, alert_arc) = {
         let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
         rt.stop_singbox();
+        if let Ok(mut logs) = rt.logs.lock() {
+            logs.clear();
+        }
         if let Ok(mut alert) = rt.last_mitm_alert.lock() {
             *alert = None;
         }
@@ -543,6 +833,18 @@ fn start_hardened_singbox_tun(
         spawn_service_log_thread(stderr, Arc::clone(&logs_arc), Arc::clone(&alert_arc));
     }
 
+    // Brief check to catch immediate sing-box startup / wintun failures and return stderr clearly
+    std::thread::sleep(Duration::from_millis(350));
+    if let Ok(Some(exit_status)) = child.try_wait() {
+        let tail = logs_arc
+            .lock()
+            .map(|r| r.iter().rev().take(6).rev().cloned().collect::<Vec<_>>().join(" | "))
+            .unwrap_or_default();
+        return Err(format!(
+            "sing-box TUN 内核启动后立即退出 ({exit_status}): {tail}"
+        ));
+    }
+
     let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
     rt.child = Some(child);
     rt.singbox_pid = Some(pid);
@@ -557,7 +859,7 @@ fn spawn_service_log_thread<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         let buf = BufReader::new(reader);
         for line in buf.lines().map_while(Result::ok) {
-            if let Some(spki) = detect_singbox_log_pin_mismatch(&line) {
+            if let Some(spki) = crate::protocol::detect_singbox_log_pin_mismatch(&line) {
                 if let Ok(mut alert) = mitm_alert.lock() {
                     *alert = Some(spki);
                 }
@@ -572,29 +874,78 @@ fn spawn_service_log_thread<R: std::io::Read + Send + 'static>(
     });
 }
 
+fn reject_if_reparse_point(path: &Path) -> Result<(), String> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            return Err(format!("refusing symlink/junction at '{}'", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn icacls_exe_path() -> PathBuf {
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    PathBuf::from(sys_root).join("System32").join("icacls.exe")
+}
+
+fn program_data_maxq_root() -> PathBuf {
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+    PathBuf::from(base).join("MaxQ")
+}
+
+/// Writes non-secret install/service diagnostics to `%ProgramData%\MaxQ\diagnostics\last-status.txt`
+/// (writable ONLY by SYSTEM + Administrators, read-only for Users so the non-elevated GUI can
+/// display exact error reasons instead of failing silently).
+fn write_diagnostic_status(message: &str) {
+    let root = program_data_maxq_root();
+    let diag_dir = root.join(DIAGNOSTIC_STATUS_SUBDIR);
+    let diag_file = diag_dir.join(DIAGNOSTIC_STATUS_FILE);
+
+    if reject_if_reparse_point(&root).is_err()
+        || reject_if_reparse_point(&diag_dir).is_err()
+        || reject_if_reparse_point(&diag_file).is_err()
+    {
+        return;
+    }
+    if std::fs::create_dir_all(&diag_dir).is_err() {
+        return;
+    }
+
+    let icacls = icacls_exe_path();
+    let _ = Command::new(&icacls)
+        .arg(&diag_dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "/grant:r",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/grant:r",
+            "*S-1-5-32-545:(OI)(CI)R",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    if reject_if_reparse_point(&diag_file).is_ok() {
+        let _ = std::fs::write(&diag_file, message.as_bytes());
+    }
+}
+
 /// Ensures `C:\ProgramData\MaxQ\<subdir>` exists without symlinks/junctions and is ACL-locked to
 /// SYSTEM + Administrators only (using absolute System32\icacls.exe and locale-independent SIDs).
 fn ensure_system_only_dir(subdir: &str) -> Result<PathBuf, String> {
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-    let root = PathBuf::from(base).join("MaxQ");
+    let root = program_data_maxq_root();
     let dir = root.join(subdir);
 
     // Reject NTFS junctions/symlinks (FILE_ATTRIBUTE_REPARSE_POINT) before writing as SYSTEM (C-3)
-    for p in [&root, &dir] {
-        if let Ok(meta) = std::fs::symlink_metadata(p) {
-            if meta.file_type().is_symlink()
-                || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-            {
-                return Err(format!("refusing symlink/junction at '{}'", p.display()));
-            }
-        }
-    }
+    reject_if_reparse_point(&root)?;
+    reject_if_reparse_point(&dir)?;
 
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {subdir} dir failed: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {subdir} 目录失败: {e}"))?;
 
-    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let icacls_exe = PathBuf::from(sys_root).join("System32").join("icacls.exe");
-
+    let icacls_exe = icacls_exe_path();
     for target in [&root, &dir] {
         let out = Command::new(&icacls_exe)
             .arg(target)
@@ -604,17 +955,33 @@ fn ensure_system_only_dir(subdir: &str) -> Result<PathBuf, String> {
                 "*S-1-5-18:(OI)(CI)F",
                 "/grant:r",
                 "*S-1-5-32-544:(OI)(CI)F",
-                "/T",
             ])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .map_err(|e| format!("failed to execute icacls.exe: {e}"))?;
+            .map_err(|e| format!("执行 icacls.exe 失败: {e}"))?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
             return Err(format!(
-                "icacls.exe failed on '{}' (status={})",
+                "icacls.exe 锁定 '{}' 失败 (status={}): {} {}",
                 target.display(),
-                out.status
+                out.status,
+                stdout.trim(),
+                stderr.trim()
             ));
+        }
+    }
+
+    // Also strip any pre-existing explicit permissive ACEs on existing entries inside `dir`
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            reject_if_reparse_point(&p)?;
+            let _ = Command::new(&icacls_exe)
+                .arg(&p)
+                .args(["/reset"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
         }
     }
 
