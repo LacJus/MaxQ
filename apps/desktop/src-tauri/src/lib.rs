@@ -287,7 +287,7 @@ pub fn run() {
                 let state = window.state::<AppState>();
                 if let Ok(mut sp) = state.sysproxy.lock() {
                     let _ = sp.disable_and_restore();
-                }
+                };
             }
         })
         .invoke_handler(tauri::generate_handler![
