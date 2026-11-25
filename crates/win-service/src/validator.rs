@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -63,6 +64,153 @@ pub fn verify_binary_sha256(path: &Path, expected_hex: &str) -> Result<String, S
         ));
     }
     Ok(actual)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedVerificationEntry {
+    fingerprint: FileFingerprint,
+    expected_hex_lower: String,
+    verified: bool,
+}
+
+fn snapshot_regular_file(path: &Path) -> Option<FileFingerprint> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return None;
+        }
+    }
+    let modified = meta.modified().ok()?;
+    Some(FileFingerprint {
+        path: path.to_path_buf(),
+        len: meta.len(),
+        modified,
+        #[cfg(windows)]
+        creation_time: {
+            use std::os::windows::fs::MetadataExt;
+            meta.creation_time()
+        },
+        #[cfg(windows)]
+        last_write_time: {
+            use std::os::windows::fs::MetadataExt;
+            meta.last_write_time()
+        },
+    })
+}
+
+/// Metadata-keyed cache for read-only `Ping` / `Status` SHA-256 health checks.
+///
+/// SECURITY INVARIANT:
+/// - `is_verified()` is strictly for read-only status reporting so frequent GUI polling does not
+///   re-read and hash the ~35 MB `sing-box.exe` binary every 1.8 seconds.
+/// - Process launch (`StartTun`) MUST always call `verify_uncached_and_refresh()`, which performs
+///   an unconditional full-file cryptographic SHA-256 check immediately before `Command::spawn()`.
+/// - Symlinks and NTFS reparse points are rejected and never cached.
+#[derive(Debug, Default)]
+pub struct CachedBinaryVerifier {
+    entry: Option<CachedVerificationEntry>,
+    #[cfg(test)]
+    hash_computations: usize,
+}
+
+impl CachedBinaryVerifier {
+    /// Returns cached verification status when `(path, len, mtime[, creation/write_time])` is
+    /// unchanged; otherwise streams and hashes the file once and caches the result if metadata
+    /// remained stable across the hash.
+    pub fn is_verified(&mut self, path: &Path, expected_hex: &str) -> bool {
+        let Some(before) = snapshot_regular_file(path) else {
+            self.entry = None;
+            return false;
+        };
+        let expected_lower = expected_hex.trim().to_ascii_lowercase();
+        if let Some(cached) = &self.entry {
+            if cached.fingerprint == before && cached.expected_hex_lower == expected_lower {
+                return cached.verified;
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.hash_computations += 1;
+        }
+        let verified = verify_binary_sha256(path, expected_hex).is_ok();
+        if let Some(after) = snapshot_regular_file(path) {
+            if after == before {
+                self.entry = Some(CachedVerificationEntry {
+                    fingerprint: after,
+                    expected_hex_lower: expected_lower,
+                    verified,
+                });
+            } else {
+                self.entry = None;
+            }
+        } else {
+            self.entry = None;
+        }
+        verified
+    }
+
+    /// Always performs a full, uncached SHA-256 verification immediately before launching
+    /// `sing-box.exe`, rejecting symlinks/reparse points and mid-hash TOCTOU changes, then
+    /// refreshes the status cache.
+    pub fn verify_uncached_and_refresh(
+        &mut self,
+        path: &Path,
+        expected_hex: &str,
+    ) -> Result<String, String> {
+        let before = snapshot_regular_file(path).ok_or_else(|| {
+            self.entry = None;
+            format!(
+                "refusing missing, non-regular, or symlink binary '{}'",
+                path.display()
+            )
+        })?;
+
+        #[cfg(test)]
+        {
+            self.hash_computations += 1;
+        }
+        let res = verify_binary_sha256(path, expected_hex);
+        let expected_lower = expected_hex.trim().to_ascii_lowercase();
+        match snapshot_regular_file(path) {
+            Some(after) if after == before => {
+                self.entry = Some(CachedVerificationEntry {
+                    fingerprint: after,
+                    expected_hex_lower: expected_lower,
+                    verified: res.is_ok(),
+                });
+                res
+            }
+            _ => {
+                self.entry = None;
+                Err(format!(
+                    "binary '{}' changed during SHA-256 verification (TOCTOU detected)",
+                    path.display()
+                ))
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.entry = None;
+    }
 }
 
 /// Verifies that the IPC caller executable (`caller_exe`) belongs to the exact same
@@ -431,5 +579,91 @@ mod tests {
         let mut evil_ob = valid_ws.clone();
         evil_ob["outbounds"] = json!([{ "type": "tor", "tag": "p" }]);
         assert!(validate_service_config(&evil_ob.to_string()).is_err());
+    }
+
+    #[test]
+    fn cached_binary_verifier_hashes_once_and_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "maxq_cached_verifier_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("sing-box-fake.bin");
+
+        let good_bytes = b"maxq-singbox-authentic-payload-v1.14.4";
+        std::fs::write(&bin, good_bytes).unwrap();
+        let expected_sha = hex::encode(Sha256::digest(good_bytes));
+
+        let mut verifier = CachedBinaryVerifier::default();
+        for _ in 0..5 {
+            assert!(verifier.is_verified(&bin, &expected_sha));
+        }
+        assert_eq!(
+            verifier.hash_computations, 1,
+            "repeated Status/Ping queries must hit metadata cache after initial hash"
+        );
+
+        // Tamper with file (different length guarantees immediate fingerprint mismatch)
+        std::fs::write(&bin, b"tampered-binary-payload-longer-bytes").unwrap();
+        assert!(!verifier.is_verified(&bin, &expected_sha));
+        assert_eq!(verifier.hash_computations, 2);
+
+        // Repeated status polls against an unchanged bad binary must also not spin-hash
+        assert!(!verifier.is_verified(&bin, &expected_sha));
+        assert_eq!(verifier.hash_computations, 2);
+
+        // Restore authentic bytes -> detected immediately and re-verified once
+        std::fs::write(&bin, good_bytes).unwrap();
+        assert!(verifier.is_verified(&bin, &expected_sha));
+        assert_eq!(verifier.hash_computations, 3);
+
+        // Security-critical StartTun path MUST always re-hash unconditionally
+        assert!(verifier
+            .verify_uncached_and_refresh(&bin, &expected_sha)
+            .is_ok());
+        assert_eq!(verifier.hash_computations, 4);
+
+        // Subsequent Status call after StartTun reuses refreshed cache without re-hashing
+        assert!(verifier.is_verified(&bin, &expected_sha));
+        assert_eq!(verifier.hash_computations, 4);
+
+        // Deleting file immediately reports unverified
+        std::fs::remove_file(&bin).unwrap();
+        assert!(!verifier.is_verified(&bin, &expected_sha));
+        assert!(verifier
+            .verify_uncached_and_refresh(&bin, &expected_sha)
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_binary_verifier_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "maxq_cached_verifier_symlink_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.bin");
+        let link = dir.join("link.bin");
+
+        let bytes = b"authentic-target";
+        std::fs::write(&target, bytes).unwrap();
+        let expected_sha = hex::encode(Sha256::digest(bytes));
+        symlink(&target, &link).unwrap();
+
+        let mut verifier = CachedBinaryVerifier::default();
+        assert!(!verifier.is_verified(&link, &expected_sha));
+        assert!(verifier
+            .verify_uncached_and_refresh(&link, &expected_sha)
+            .is_err());
+        assert_eq!(verifier.hash_computations, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

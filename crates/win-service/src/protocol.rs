@@ -45,7 +45,7 @@ pub const DIAGNOSTIC_STATUS_FILE: &str = "last-status.txt";
 pub const SING_BOX_V14_4_WIN64_SHA256: &str =
     "8f30682ee198855440d2a7fe070d5d3653793b2d01bb8c85eea88f93bbe7c8b9";
 
-pub const SERVICE_PROTOCOL_VERSION: &str = "1.0.2";
+pub const SERVICE_PROTOCOL_VERSION: &str = "1.0.3";
 
 /// Strict zero-arbitrary-execution IPC command set.
 /// NEVER accepts executable paths, CLI flags, or working directories.

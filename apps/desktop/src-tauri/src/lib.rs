@@ -47,11 +47,40 @@ pub struct AppState {
     pub service_exe_path: Option<PathBuf>,
     pub tun_active_node: Mutex<Option<(String, String)>>,
     pub clash_api_session: Mutex<Option<ActiveClashApiSession>>,
+    /// Reusable no-proxy HTTP client strictly for loopback `127.0.0.1` Clash API telemetry/control
+    /// (avoids allocating a brand-new reqwest connection pool every 1.8s poll).
+    pub local_http_client: reqwest::Client,
+    /// Short-lived (1s) coalescing cache so concurrent per-tick polls (`get_runtime_status`,
+    /// `get_runtime_logs`, `get_tun_service_status`) share a single Named Pipe / SCM query.
+    pub tun_status_cache: AsyncMutex<Option<(Instant, TunServiceStatus)>>,
     /// Serializes start/stop/reset/delete lifecycle transitions so concurrent clicks or shutdown
     /// can NEVER interleave and re-enable system proxy after disconnect/exit.
     pub lifecycle_lock: AsyncMutex<()>,
     pub shutdown_requested: AtomicBool,
     pub lifecycle_epoch: AtomicU64,
+}
+
+const TUN_STATUS_CACHE_TTL: Duration = Duration::from_millis(1000);
+
+async fn query_tun_status_coalesced(state: &AppState, force_refresh: bool) -> TunServiceStatus {
+    let mut cache = state.tun_status_cache.lock().await;
+    if !force_refresh {
+        if let Some((captured_at, cached)) = cache.as_ref() {
+            if captured_at.elapsed() < TUN_STATUS_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+    let fresh = tokio::task::spawn_blocking(TunServiceClient::query_status)
+        .await
+        .unwrap_or_default();
+    *cache = Some((Instant::now(), fresh.clone()));
+    fresh
+}
+
+async fn invalidate_tun_status_cache(state: &AppState) {
+    let mut cache = state.tun_status_cache.lock().await;
+    *cache = None;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,10 +156,8 @@ fn get_builtin_rules_info() -> BuiltinRulesInfo {
 }
 
 #[tauri::command]
-async fn get_tun_service_status() -> TunServiceStatus {
-    tokio::task::spawn_blocking(TunServiceClient::query_status)
-        .await
-        .unwrap_or_default()
+async fn get_tun_service_status(state: State<'_, AppState>) -> TunServiceStatus {
+    query_tun_status_coalesced(&state, false).await
 }
 
 #[tauri::command]
@@ -142,7 +169,7 @@ async fn install_tun_service(state: State<'_, AppState>) -> Result<String, Strin
             "未找到已打包的绝对路径 maxq-service.exe，请通过官方安装包安装 MaxQ。".to_string()
         })?;
 
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
         TunServiceClient::install_elevated(&exe).map_err(|e| e.to_string())?;
 
         // Poll up to 4s for Named Pipe IPC to confirm service is live and authenticated
@@ -165,7 +192,9 @@ async fn install_tun_service(state: State<'_, AppState>) -> Result<String, Strin
         Err(format!("TUN 服务安装流程已结束但未能就绪：{detail}"))
     })
     .await
-    .map_err(|e| format!("后台安装任务异常: {e}"))?
+    .map_err(|e| format!("后台安装任务异常: {e}"))?;
+    invalidate_tun_status_cache(&state).await;
+    result
 }
 
 #[tauri::command]
@@ -175,13 +204,15 @@ async fn uninstall_tun_service(state: State<'_, AppState>) -> Result<String, Str
         .clone()
         .ok_or_else(|| "未找到已打包的绝对路径 maxq-service.exe。".to_string())?;
 
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let _ = TunServiceClient::stop_tun();
         TunServiceClient::uninstall_elevated(&exe).map_err(|e| e.to_string())?;
         Ok("已停止并卸载 MaxQ TUN 服务。".into())
     })
     .await
-    .map_err(|e| format!("后台卸载任务异常: {e}"))?
+    .map_err(|e| format!("后台卸载任务异常: {e}"))?;
+    invalidate_tun_status_cache(&state).await;
+    result
 }
 
 #[tauri::command]
@@ -358,6 +389,7 @@ async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Resul
             }
         }
         let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+        invalidate_tun_status_cache(&state).await;
         if let Ok(mut guard) = state.tun_active_node.lock() {
             *guard = None;
         }
@@ -413,9 +445,7 @@ async fn export_diagnostics_summary(state: State<'_, AppState>) -> Result<String
         let policy = store.load_runtime_policy().map_err(|e| e.to_string())?;
         (stats, policy)
     };
-    let tun = tokio::task::spawn_blocking(TunServiceClient::query_status)
-        .await
-        .unwrap_or_default();
+    let tun = query_tun_status_coalesced(&state, true).await;
     let summary = format!(
         "=== MaxQ Redacted Diagnostics ===\n\
          App: MaxQ v{} ({}/{})\n\
@@ -743,6 +773,7 @@ async fn start_proxy(
         }
     }
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+    invalidate_tun_status_cache(&state).await;
     if let Ok(mut guard) = state.clash_api_session.lock() {
         *guard = None;
     }
@@ -759,10 +790,12 @@ async fn start_proxy(
             .await
             .map_err(|e| format!("TUN 启动任务异常: {e}"))?
             .map_err(|e| e.to_string())?;
+        invalidate_tun_status_cache(&state).await;
         if state.shutdown_requested.load(Ordering::Acquire)
             || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
         {
             let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+            invalidate_tun_status_cache(&state).await;
             return Err("连接已被新的断开或退出操作取消".into());
         }
         if let Ok(mut guard) = state.tun_active_node.lock() {
@@ -859,6 +892,7 @@ async fn stop_proxy(state: State<'_, AppState>) -> Result<RuntimeStatus, String>
         }
     };
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+    invalidate_tun_status_cache(&state).await;
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
     }
@@ -885,6 +919,7 @@ async fn reset_system_proxy(state: State<'_, AppState>) -> Result<String, String
     let _lifecycle = state.lifecycle_lock.lock().await;
 
     let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+    invalidate_tun_status_cache(&state).await;
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
     }
@@ -917,14 +952,15 @@ async fn get_runtime_telemetry(state: State<'_, AppState>) -> Result<RuntimeTele
         return Ok(RuntimeTelemetry::default());
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1200))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let url = format!("http://127.0.0.1:{port}/connections");
-    let resp = match client.get(&url).bearer_auth(&secret).send().await {
+    let resp = match state
+        .local_http_client
+        .get(&url)
+        .bearer_auth(&secret)
+        .timeout(Duration::from_millis(1200))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => {
             return Ok(RuntimeTelemetry {
@@ -1058,21 +1094,20 @@ async fn close_all_connections(state: State<'_, AppState>) -> Result<(), String>
     let Some((port, secret)) = session_meta else {
         return Ok(());
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
     let url = format!("http://127.0.0.1:{port}/connections");
-    let _ = client.delete(&url).bearer_auth(&secret).send().await;
+    let _ = state
+        .local_http_client
+        .delete(&url)
+        .bearer_auth(&secret)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
     Ok(())
 }
 
 #[tauri::command]
 async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    let tun_st = tokio::task::spawn_blocking(TunServiceClient::query_status)
-        .await
-        .unwrap_or_default();
+    let tun_st = query_tun_status_coalesced(&state, false).await;
     if tun_st.tun_active {
         let (nid, nname) = state
             .tun_active_node
@@ -1125,18 +1160,11 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
 
 #[tauri::command]
 async fn get_runtime_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let tun_logs = tokio::task::spawn_blocking(|| {
-        let st = TunServiceClient::query_status();
-        if st.tun_active {
-            Some(TunServiceClient::get_logs())
-        } else {
-            None
-        }
-    })
-    .await
-    .ok()
-    .flatten();
-    if let Some(lines) = tun_logs {
+    let tun_st = query_tun_status_coalesced(&state, false).await;
+    if tun_st.tun_active {
+        let lines = tokio::task::spawn_blocking(TunServiceClient::get_logs)
+            .await
+            .unwrap_or_default();
         return Ok(lines);
     }
     let sup = state.supervisor.lock().await;
@@ -1194,6 +1222,9 @@ fn cleanup_all_runtime(app_handle: &tauri::AppHandle, is_shutdown: bool) {
     }
 
     let _ = TunServiceClient::stop_tun();
+    if let Ok(mut cache) = state.tun_status_cache.try_lock() {
+        *cache = None;
+    }
 
     if let Ok(mut guard) = state.tun_active_node.lock() {
         *guard = None;
@@ -1250,6 +1281,11 @@ pub fn run() {
                 .unwrap_or_else(|| PathBuf::from(singbox_name));
             let service_exe_path = resolve_bundled_binary(app, "maxq-service.exe");
             let supervisor = SingBoxSupervisor::new(singbox_path, runtime_dir);
+            let local_http_client = reqwest::Client::builder()
+                .no_proxy()
+                .pool_max_idle_per_host(2)
+                .build()
+                .expect("failed to build loopback Clash API HTTP client");
 
             app.manage(AppState {
                 store: Mutex::new(store),
@@ -1258,6 +1294,8 @@ pub fn run() {
                 service_exe_path,
                 tun_active_node: Mutex::new(None),
                 clash_api_session: Mutex::new(None),
+                local_http_client,
+                tun_status_cache: AsyncMutex::new(None),
                 lifecycle_lock: AsyncMutex::new(()),
                 shutdown_requested: AtomicBool::new(false),
                 lifecycle_epoch: AtomicU64::new(0),

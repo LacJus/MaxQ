@@ -150,7 +150,7 @@ const DEFAULT_ABOUT: AboutInfo = {
   os: "windows",
   arch: "x86_64",
   builtin_rule_count: 8581,
-  service_protocol_version: "1.0.2",
+  service_protocol_version: "1.0.3",
   total_profiles: 0,
   total_nodes: 0,
   pinned_spki_nodes: 0,
@@ -248,6 +248,7 @@ export default function App() {
   const proxyBusyRef = useRef(false);
   const wasRunningRef = useRef(false);
   const userStopRef = useRef(false);
+  const tabRef = useRef<Tab>(tab);
 
   // Import Modal State
   const [importOpen, setImportOpen] = useState(false);
@@ -356,7 +357,18 @@ export default function App() {
     }
   };
 
-  // Real-time Rust polling for runtime status, logs, TUN service, and live Clash API telemetry
+  // Keep tabRef synced and immediately refresh logs when entering the Logs tab
+  useEffect(() => {
+    tabRef.current = tab;
+    if (tab === "logs" && inTauri) {
+      api
+        .getRuntimeLogs()
+        .then(setLogs)
+        .catch(() => {});
+    }
+  }, [tab, inTauri]);
+
+  // Real-time Rust polling for runtime status, TUN service, live Clash API telemetry, and (on Logs tab) logs
   useEffect(() => {
     refreshAll();
     if (!inTauri) return;
@@ -364,11 +376,12 @@ export default function App() {
       if (pollInFlightRef.current) return;
       pollInFlightRef.current = true;
       try {
-        const [st, l, tunSt, tel] = await Promise.all([
+        const shouldPollLogs = tabRef.current === "logs";
+        const [st, tunSt, tel, l] = await Promise.all([
           api.getRuntimeStatus(),
-          api.getRuntimeLogs(),
           api.getTunServiceStatus(),
           api.getRuntimeTelemetry(),
+          shouldPollLogs ? api.getRuntimeLogs() : Promise.resolve(null),
         ]);
         if (wasRunningRef.current && !st.running && !userStopRef.current && !proxyBusyRef.current) {
           showToast(
@@ -381,9 +394,11 @@ export default function App() {
           userStopRef.current = false;
         }
         setStatus(st);
-        setLogs(l);
         setTunService(tunSt);
         setTelemetry(tel);
+        if (l !== null) {
+          setLogs(l);
+        }
         setSpeedHistory((prev) => [
           ...prev.slice(-27),
           {

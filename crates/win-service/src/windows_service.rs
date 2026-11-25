@@ -50,7 +50,8 @@ use crate::protocol::{
     SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_PROTOCOL_VERSION, SING_BOX_V14_4_WIN64_SHA256,
 };
 use crate::validator::{
-    is_authorized_caller_image, validate_service_config, verify_binary_sha256, MAX_CONFIG_BYTES,
+    is_authorized_caller_image, validate_service_config, verify_binary_sha256,
+    CachedBinaryVerifier, MAX_CONFIG_BYTES,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -113,6 +114,7 @@ struct ServiceRuntimeState {
     job_guard: Option<ServiceChildJobGuard>,
     active_config_path: Option<PathBuf>,
     singbox_pid: Option<u32>,
+    binary_verify_cache: CachedBinaryVerifier,
     logs: Arc<Mutex<VecDeque<String>>>,
     last_mitm_alert: Arc<Mutex<Option<String>>>,
 }
@@ -124,6 +126,7 @@ impl ServiceRuntimeState {
             job_guard: None,
             active_config_path: None,
             singbox_pid: None,
+            binary_verify_cache: CachedBinaryVerifier::default(),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOGS))),
             last_mitm_alert: Arc::new(Mutex::new(None)),
         }
@@ -801,7 +804,10 @@ fn handle_pipe_client(
 
     let resp = match req {
         ServiceRequest::Ping => {
-            let verified = verify_binary_sha256(&singbox_path, SING_BOX_V14_4_WIN64_SHA256).is_ok();
+            let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
+            let verified = rt
+                .binary_verify_cache
+                .is_verified(&singbox_path, SING_BOX_V14_4_WIN64_SHA256);
             ServiceResponse::Pong {
                 version: SERVICE_PROTOCOL_VERSION.to_string(),
                 singbox_sha256_verified: verified,
@@ -810,7 +816,9 @@ fn handle_pipe_client(
         ServiceRequest::Status => {
             let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
             let tun_active = rt.is_singbox_running();
-            let verified = verify_binary_sha256(&singbox_path, SING_BOX_V14_4_WIN64_SHA256).is_ok();
+            let verified = rt
+                .binary_verify_cache
+                .is_verified(&singbox_path, SING_BOX_V14_4_WIN64_SHA256);
             let last_alert = rt
                 .last_mitm_alert
                 .lock()
@@ -861,10 +869,13 @@ fn start_hardened_singbox_tun(
     runtime: &Arc<Mutex<ServiceRuntimeState>>,
 ) -> Result<u32, String> {
     let validated = validate_service_config(config_json)?;
-    verify_binary_sha256(singbox_path, SING_BOX_V14_4_WIN64_SHA256)?;
 
     let (logs_arc, alert_arc) = {
         let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
+        // Always perform a full, uncached cryptographic SHA-256 verification right before
+        // CreateProcessW, then refresh the status cache so subsequent Status polls are zero-I/O.
+        rt.binary_verify_cache
+            .verify_uncached_and_refresh(singbox_path, SING_BOX_V14_4_WIN64_SHA256)?;
         rt.stop_singbox();
         if let Ok(mut logs) = rt.logs.lock() {
             logs.clear();
