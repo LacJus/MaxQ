@@ -45,7 +45,7 @@ pub struct AppState {
     pub supervisor: AsyncMutex<SingBoxSupervisor>,
     pub sysproxy: Mutex<SystemProxyManager>,
     pub service_exe_path: Option<PathBuf>,
-    pub tun_active_node: Mutex<Option<(String, String)>>,
+    pub tun_active_node: Mutex<Option<(String, String, String)>>,
     pub clash_api_session: Mutex<Option<ActiveClashApiSession>>,
     /// Reusable no-proxy HTTP client strictly for loopback `127.0.0.1` Clash API telemetry/control
     /// (avoids allocating a brand-new reqwest connection pool every 1.8s poll).
@@ -57,6 +57,8 @@ pub struct AppState {
     /// can NEVER interleave and re-enable system proxy after disconnect/exit.
     pub lifecycle_lock: AsyncMutex<()>,
     pub shutdown_requested: AtomicBool,
+    pub exit_cleanup_done: AtomicBool,
+    pub tun_ever_used: AtomicBool,
     pub lifecycle_epoch: AtomicU64,
 }
 
@@ -323,12 +325,34 @@ fn commit_import(
     let raw = parse_input(&raw_input).map_err(|e| e.to_string())?;
     let mut sanitized = sanitize_import(raw);
 
-    let approved_set: HashSet<String> = approved_host_domains
-        .into_iter()
-        .map(|d| d.trim().to_ascii_lowercase())
-        .collect();
+    // Match exact `(domain_lower, target)` pairs (`"domain||target"`) so a malicious `.conf`
+    // with duplicate case-variant host entries (`a.com=1.1.1.1` + `A.COM=6.6.6.6`) cannot hijack
+    // approval of the legitimate entry (P1-8).
+    let mut exact_pairs: HashSet<(String, String)> = HashSet::new();
+    let mut legacy_domains: HashSet<String> = HashSet::new();
+    for entry in approved_host_domains {
+        let trimmed = entry.trim();
+        if let Some((dom, tgt)) = trimmed.split_once("||") {
+            exact_pairs.insert((dom.trim().to_ascii_lowercase(), tgt.trim().to_string()));
+        } else if !trimmed.is_empty() {
+            legacy_domains.insert(trimmed.to_ascii_lowercase());
+        }
+    }
+
+    // Count occurrences per lowercased domain so legacy bare-domain approvals only match unique domains
+    let mut domain_counts: HashMap<String, usize> = HashMap::new();
+    for h in &sanitized.hosts {
+        *domain_counts
+            .entry(h.domain.trim().to_ascii_lowercase())
+            .or_insert(0) += 1;
+    }
+
     for h in &mut sanitized.hosts {
-        if approved_set.contains(&h.domain.to_ascii_lowercase()) {
+        let dom_lower = h.domain.trim().to_ascii_lowercase();
+        let tgt = h.target.trim().to_string();
+        if exact_pairs.contains(&(dom_lower.clone(), tgt))
+            || (legacy_domains.contains(&dom_lower) && domain_counts.get(&dom_lower) == Some(&1))
+        {
             h.approved = true;
         }
     }
@@ -359,7 +383,7 @@ async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Resul
     let active_node_ids: HashSet<String> = {
         let mut ids = HashSet::new();
         if let Ok(guard) = state.tun_active_node.lock() {
-            if let Some((nid, _)) = guard.as_ref() {
+            if let Some((_, nid, _)) = guard.as_ref() {
                 ids.insert(nid.clone());
             }
         }
@@ -578,6 +602,9 @@ async fn probe_node_certificate(
         let store = state.store.lock().map_err(|e| e.to_string())?;
         store.get_node(&node_id).map_err(|e| e.to_string())?
     };
+    if node.tls.reality.is_some() {
+        return Err("VLESS Reality 节点使用 Reality 公钥认证，不能执行常规 TLS SPKI 证书固定。".into());
+    }
     let req = ProbeRequest::from_node(&node);
     let probed = probe_certificate(&req).await.map_err(|e| e.to_string())?;
     let eval = evaluate_probe_against_node(&node, &probed).map_err(|e| e.to_string())?;
@@ -606,6 +633,7 @@ async fn batch_probe_and_pin_profile(
         .filter(|n| {
             !n.is_metadata_node
                 && n.tls.enabled
+                && n.tls.reality.is_none()
                 && matches!(
                     n.tls.verify_mode,
                     TlsVerifyMode::InsecureLegacy { .. } | TlsVerifyMode::PendingPinBootstrap
@@ -711,9 +739,18 @@ fn confirm_node_pin(
 ) -> Result<NodeConfig, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     let mut node = store.get_node(&node_id).map_err(|e| e.to_string())?;
+    if node.tls.reality.is_some() {
+        return Err("VLESS Reality 节点不能绑定常规 TLS SPKI 指纹，已阻止自锁操作。".into());
+    }
     apply_confirmed_pin(&mut node, trust_record);
     store.update_node(&node).map_err(|e| e.to_string())?;
     Ok(node)
+}
+
+#[tauri::command]
+fn clear_node_pin(state: State<'_, AppState>, node_id: String) -> Result<NodeConfig, String> {
+    let mut store = state.store.lock().map_err(|e| e.to_string())?;
+    store.clear_node_pin(&node_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -735,16 +772,27 @@ async fn start_proxy(
     node_id: String,
     enable_system_proxy: bool,
 ) -> Result<RuntimeStatus, String> {
-    let _lifecycle = state.lifecycle_lock.lock().await;
+    // Allocate epoch BEFORE awaiting `lifecycle_lock` so any queued `start_proxy` superseded by
+    // a newer `stop_proxy` / `reset_system_proxy` / tray reset / shutdown aborts immediately (P0-4).
     if state.shutdown_requested.load(Ordering::Acquire) {
         return Err("应用正在退出，已取消连接".into());
     }
     let my_epoch = state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
+    let _lifecycle = state.lifecycle_lock.lock().await;
+    if state.shutdown_requested.load(Ordering::Acquire)
+        || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
+    {
+        return Err("连接已被新的断开、重置或退出操作取消".into());
+    }
+
     let (profile, node, mut policy) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let profile = store.get_profile(&profile_id).map_err(|e| e.to_string())?;
         let node = store.get_node(&node_id).map_err(|e| e.to_string())?;
+        if !profile.nodes.iter().any(|n| n.id == node.id) {
+            return Err("所选节点不属于当前配置，已阻止跨配置规则混用，请重新选择节点。".into());
+        }
         let policy = store.load_runtime_policy().map_err(|e| e.to_string())?;
         (profile, node, policy)
     };
@@ -772,8 +820,10 @@ async fn start_proxy(
             let _ = sp.force_disable();
         }
     }
-    let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
-    invalidate_tun_status_cache(&state).await;
+    if use_tun || state.tun_ever_used.load(Ordering::Acquire) {
+        let _ = tokio::task::spawn_blocking(TunServiceClient::stop_tun).await;
+        invalidate_tun_status_cache(&state).await;
+    }
     if let Ok(mut guard) = state.clash_api_session.lock() {
         *guard = None;
     }
@@ -785,11 +835,17 @@ async fn start_proxy(
     }
 
     if use_tun {
+        state.tun_ever_used.store(true, Ordering::Release);
         let cfg_json = serde_json::to_string(&compiled.json).map_err(|e| e.to_string())?;
-        let pid = tokio::task::spawn_blocking(move || TunServiceClient::start_tun(cfg_json))
-            .await
-            .map_err(|e| format!("TUN 启动任务异常: {e}"))?
-            .map_err(|e| e.to_string())?;
+        let p_id = profile.id.clone();
+        let n_id = node.id.clone();
+        let n_name = node.name.clone();
+        let pid = tokio::task::spawn_blocking(move || {
+            TunServiceClient::start_tun_with_meta(cfg_json, Some(p_id), Some(n_id), Some(n_name))
+        })
+        .await
+        .map_err(|e| format!("TUN 启动任务异常: {e}"))?
+        .map_err(|e| e.to_string())?;
         invalidate_tun_status_cache(&state).await;
         if state.shutdown_requested.load(Ordering::Acquire)
             || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
@@ -799,7 +855,7 @@ async fn start_proxy(
             return Err("连接已被新的断开或退出操作取消".into());
         }
         if let Ok(mut guard) = state.tun_active_node.lock() {
-            *guard = Some((node.id.clone(), node.name.clone()));
+            *guard = Some((profile.id.clone(), node.id.clone(), node.name.clone()));
         }
         if let Ok(mut guard) = state.clash_api_session.lock() {
             *guard = Some(ActiveClashApiSession {
@@ -814,6 +870,7 @@ async fn start_proxy(
         return Ok(RuntimeStatus {
             running: true,
             pid: Some(pid),
+            active_profile_id: Some(profile.id),
             active_node_id: Some(node.id),
             active_node_name: Some(node.name),
             clash_api_port: Some(policy.clash_api_port),
@@ -829,7 +886,8 @@ async fn start_proxy(
     }
 
     let mut sup = state.supervisor.lock().await;
-    sup.start(
+    sup.start_for_profile(
+        Some(profile.id.clone()),
         node.id.clone(),
         node.name.clone(),
         &compiled,
@@ -860,18 +918,46 @@ async fn start_proxy(
 
     let mut status = sup.status();
     if enable_system_proxy {
-        let enable_res = {
-            let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
-            sp.enable(policy.mixed_listen_port, &profile.general.skip_proxy)
-        };
-        if let Err(e) = enable_res {
-            let _ = sup.stop().await;
-            if let Ok(mut guard) = state.clash_api_session.lock() {
-                *guard = None;
-            }
-            return Err(format!("启用 Windows 系统代理失败：{e}"));
+        enum EnableOutcome {
+            Ok,
+            Cancelled,
+            Failed(String),
         }
-        status.system_proxy_enabled = true;
+        // Check cancellation INSIDE `state.sysproxy` lock right before `sp.enable()` so
+        // `cleanup_all_runtime` (which sets shutdown/epoch FIRST and disables sysproxy LAST)
+        // can NEVER race and leave a stranded Windows system proxy on exit (P0-4).
+        let outcome = {
+            let mut sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
+            if state.shutdown_requested.load(Ordering::Acquire)
+                || state.lifecycle_epoch.load(Ordering::Acquire) != my_epoch
+            {
+                EnableOutcome::Cancelled
+            } else {
+                match sp.enable(policy.mixed_listen_port, &profile.general.skip_proxy) {
+                    Ok(()) => EnableOutcome::Ok,
+                    Err(e) => EnableOutcome::Failed(e.to_string()),
+                }
+            }
+        };
+        match outcome {
+            EnableOutcome::Ok => {
+                status.system_proxy_enabled = true;
+            }
+            EnableOutcome::Cancelled => {
+                let _ = sup.stop().await;
+                if let Ok(mut guard) = state.clash_api_session.lock() {
+                    *guard = None;
+                }
+                return Err("连接已被新的断开或退出操作取消".into());
+            }
+            EnableOutcome::Failed(e) => {
+                let _ = sup.stop().await;
+                if let Ok(mut guard) = state.clash_api_session.lock() {
+                    *guard = None;
+                }
+                return Err(format!("启用 Windows 系统代理失败：{e}"));
+            }
+        }
     }
     Ok(status)
 }
@@ -1109,13 +1195,30 @@ async fn close_all_connections(state: State<'_, AppState>) -> Result<(), String>
 async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
     let tun_st = query_tun_status_coalesced(&state, false).await;
     if tun_st.tun_active {
-        let (nid, nname) = state
-            .tun_active_node
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .map(|(a, b)| (Some(a), Some(b)))
-            .unwrap_or((None, None));
+        state.tun_ever_used.store(true, Ordering::Release);
+        let local_meta = state.tun_active_node.lock().ok().and_then(|g| g.clone());
+        let (pid_opt, nid_opt, nname_opt) = match local_meta {
+            Some((p, n, name)) => (Some(p), Some(n), Some(name)),
+            None => {
+                // Recover active profile/node metadata from MaxQTunService after GUI restart (P2-1)
+                if let (Some(p), Some(n), Some(name)) = (
+                    tun_st.active_profile_id.clone(),
+                    tun_st.active_node_id.clone(),
+                    tun_st.active_node_name.clone(),
+                ) {
+                    if let Ok(mut guard) = state.tun_active_node.lock() {
+                        *guard = Some((p.clone(), n.clone(), name.clone()));
+                    }
+                    (Some(p), Some(n), Some(name))
+                } else {
+                    (
+                        tun_st.active_profile_id.clone(),
+                        tun_st.active_node_id.clone(),
+                        tun_st.active_node_name.clone(),
+                    )
+                }
+            }
+        };
         let clash_port = state
             .clash_api_session
             .lock()
@@ -1124,14 +1227,30 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
         return Ok(RuntimeStatus {
             running: true,
             pid: tun_st.singbox_pid,
-            active_node_id: nid,
-            active_node_name: nname,
+            active_profile_id: pid_opt,
+            active_node_id: nid_opt,
+            active_node_name: nname_opt,
             clash_api_port: clash_port,
             mixed_port: None,
             system_proxy_enabled: false,
             tun_active: true,
             last_mitm_alert: tun_st.last_mitm_alert,
         });
+    }
+
+    // If TUN mode was previously active and sing-box.exe exited unexpectedly (crash / AV kill),
+    // immediately clear stale `tun_active_node` and `clash_api_session` so telemetry stops polling
+    // the closed Clash API port (P1-4).
+    let tun_died_unexpectedly = state
+        .tun_active_node
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .is_some();
+    if tun_died_unexpectedly {
+        if let Ok(mut guard) = state.clash_api_session.lock() {
+            *guard = None;
+        }
     }
 
     let mut sup = state.supervisor.lock().await;
@@ -1152,6 +1271,9 @@ async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus,
     }
 
     let mut status = sup.status();
+    if status.last_mitm_alert.is_none() && tun_st.last_mitm_alert.is_some() {
+        status.last_mitm_alert = tun_st.last_mitm_alert;
+    }
     let sp = state.sysproxy.lock().map_err(|e| e.to_string())?;
     status.system_proxy_enabled = sp.is_active();
     status.tun_active = false;
@@ -1167,8 +1289,32 @@ async fn get_runtime_logs(state: State<'_, AppState>) -> Result<Vec<String>, Str
             .unwrap_or_default();
         return Ok(lines);
     }
-    let sup = state.supervisor.lock().await;
-    Ok(sup.recent_logs())
+
+    let (user_running, user_logs) = {
+        let sup = state.supervisor.lock().await;
+        (sup.status().running, sup.recent_logs())
+    };
+    if user_running {
+        return Ok(user_logs);
+    }
+
+    // Preserve post-crash TUN stderr logs when ProxyMode::Tun is selected and service is running (P1-4)
+    let is_tun_policy = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|s| s.load_runtime_policy().ok())
+        .is_some_and(|p| p.proxy_mode == ProxyMode::Tun);
+    if is_tun_policy && tun_st.running {
+        let tun_lines = tokio::task::spawn_blocking(TunServiceClient::get_logs)
+            .await
+            .unwrap_or_default();
+        if !tun_lines.is_empty() {
+            return Ok(tun_lines);
+        }
+    }
+
+    Ok(user_logs)
 }
 
 #[tauri::command]
@@ -1201,27 +1347,59 @@ fn resolve_bundled_binary(app: &tauri::App, bin_name: &str) -> Option<PathBuf> {
             return Some(direct);
         }
     }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("resources").join(bin_name);
+            if candidate.is_absolute() && candidate.exists() {
+                return Some(candidate);
+            }
+            let direct = dir.join(bin_name);
+            if direct.is_absolute() && direct.exists() {
+                return Some(direct);
+            }
+        }
+    }
     None
 }
 
 /// Unified, idempotent runtime teardown executed on tray quit, window close/destroy,
 /// and Tauri `RunEvent::ExitRequested` / `RunEvent::Exit` (including OS logoff/shutdown).
+///
+/// Ordering invariant (P0-4):
+/// 1. Mark `shutdown_requested` & bump `lifecycle_epoch` FIRST so in-flight `start_proxy` aborts.
+/// 2. Stop user-mode `sing-box` & TUN service (only if TUN was ever active/used in session).
+/// 3. Disable/restore Windows System Proxy LAST under `state.sysproxy.lock()`, guaranteeing no
+///    concurrent `start_proxy` can re-enable system proxy after cleanup completes.
 fn cleanup_all_runtime(app_handle: &tauri::AppHandle, is_shutdown: bool) {
     let state = app_handle.state::<AppState>();
 
-    // Cancel any in-flight `start_proxy` FIRST so it can never re-enable system proxy after cleanup
     if is_shutdown {
         state.shutdown_requested.store(true, Ordering::Release);
+        // Deduplicate repeated CloseRequested -> Destroyed -> ExitRequested -> Exit events (P2-2)
+        if state.exit_cleanup_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
     }
     state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
 
-    if let Ok(mut sp) = state.sysproxy.lock() {
-        if sp.disable_and_restore().is_err() {
-            let _ = sp.force_disable();
-        }
-    }
+    if let Ok(mut sup) = state.supervisor.try_lock() {
+        sup.stop_sync();
+    } else {
+        tauri::async_runtime::block_on(async {
+            let mut sup = state.supervisor.lock().await;
+            sup.stop_sync();
+        });
+    };
 
-    let _ = TunServiceClient::stop_tun();
+    let should_stop_tun = state.tun_ever_used.load(Ordering::Acquire)
+        || state
+            .tun_active_node
+            .lock()
+            .ok()
+            .is_some_and(|g| g.is_some());
+    if should_stop_tun {
+        let _ = TunServiceClient::stop_tun();
+    }
     if let Ok(mut cache) = state.tun_status_cache.try_lock() {
         *cache = None;
     }
@@ -1233,18 +1411,23 @@ fn cleanup_all_runtime(app_handle: &tauri::AppHandle, is_shutdown: bool) {
         *guard = None;
     }
 
-    if let Ok(mut sup) = state.supervisor.try_lock() {
-        sup.stop_sync();
-    } else {
-        tauri::async_runtime::block_on(async {
-            let mut sup = state.supervisor.lock().await;
-            sup.stop_sync();
-        });
+    if let Ok(mut sp) = state.sysproxy.lock() {
+        if sp.disable_and_restore().is_err() {
+            let _ = sp.force_disable();
+        }
     };
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Headless NSIS pre-uninstall hook entrypoint (`maxq-desktop.exe --cleanup-sysproxy`):
+    // clears stranded loopback Windows system proxy entries across HKCU and loaded HKU hives
+    // without opening UI or taking mutex (P0-5).
+    if std::env::args().any(|a| a == "--cleanup-sysproxy") {
+        maxq_core_runtime::system_proxy::cleanup_all_users_loopback_proxies();
+        return;
+    }
+
     // Enforce single desktop instance BEFORE touching `sysproxy-backup.json` or SQLite vault!
     let _single_instance = match SingleInstanceGuard::acquire_or_focus_existing(
         "MaxQ — Powered by JaxCore sing-box",
@@ -1277,8 +1460,13 @@ pub fn run() {
             } else {
                 "sing-box"
             };
-            let singbox_path = resolve_bundled_binary(app, singbox_name)
-                .unwrap_or_else(|| PathBuf::from(singbox_name));
+            // Strictly resolve absolute path next to bundle/exe — NEVER fall back to CWD-relative name (P0-2)
+            let singbox_path = resolve_bundled_binary(app, singbox_name).unwrap_or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("resources").join(singbox_name)))
+                    .unwrap_or_else(|| data_dir.join("missing-sing-box"))
+            });
             let service_exe_path = resolve_bundled_binary(app, "maxq-service.exe");
             let supervisor = SingBoxSupervisor::new(singbox_path, runtime_dir);
             let local_http_client = reqwest::Client::builder()
@@ -1298,6 +1486,8 @@ pub fn run() {
                 tun_status_cache: AsyncMutex::new(None),
                 lifecycle_lock: AsyncMutex::new(()),
                 shutdown_requested: AtomicBool::new(false),
+                exit_cleanup_done: AtomicBool::new(false),
+                tun_ever_used: AtomicBool::new(false),
                 lifecycle_epoch: AtomicU64::new(0),
             });
 
@@ -1385,6 +1575,7 @@ pub fn run() {
             probe_node_certificate,
             batch_probe_and_pin_profile,
             confirm_node_pin,
+            clear_node_pin,
             set_insecure_override,
             start_proxy,
             stop_proxy,

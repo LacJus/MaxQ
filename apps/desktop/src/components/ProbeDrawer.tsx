@@ -10,6 +10,7 @@ interface ProbeDrawerProps {
   onClose: () => void;
   onReprobe: (node: NodeConfig) => void;
   onConfirmPin: () => void;
+  onClearPin: () => void;
   onTemporaryOverride: () => void;
 }
 
@@ -21,10 +22,12 @@ export function ProbeDrawer({
   onClose,
   onReprobe,
   onConfirmPin,
+  onClearPin,
   onTemporaryOverride,
 }: ProbeDrawerProps) {
   if (!node) return null;
 
+  const isReality = Boolean(node.tls.reality);
   const activeSpki = probeResult?.probed.spki_sha256_b64 ?? node.tls.trust_record?.spki_sha256_b64;
 
   return (
@@ -76,20 +79,31 @@ export function ProbeDrawer({
               </div>
             )}
             <div style={{ color: "var(--mq-ink-2)" }}>
-              采用内置独立 Rustls / Quinn（支持 Hysteria2 Salamander）直接完成真实 TLS 握手，
-              <strong style={{ color: "var(--mq-ink)" }}>完全绕过 Windows Schannel 限制</strong>
-              ，并生成唯一几何 SPKI 徽章供人工快速比对。
+              {isReality ? (
+                <>
+                  当前节点采用 <strong style={{ color: "var(--mq-ink)" }}>VLESS Reality</strong>{" "}
+                  公钥认证，底层由服务端 Reality 密钥直接校验身份，无需也不可叠加常规 SPKI 证书固定。
+                </>
+              ) : (
+                <>
+                  采用内置独立 Rustls / Quinn（支持 Hysteria2 Salamander）直接完成真实 TLS 握手，
+                  <strong style={{ color: "var(--mq-ink)" }}>完全绕过 Windows Schannel 限制</strong>
+                  ，并生成唯一几何 SPKI 徽章供人工快速比对。
+                </>
+              )}
             </div>
           </div>
 
-          <button
-            onClick={() => onReprobe(node)}
-            disabled={probeLoading}
-            className="mq-btn mq-btn-primary flex w-full items-center justify-center gap-2 rounded-xl py-2.5 font-semibold disabled:opacity-50"
-          >
-            <RefreshCw className={`h-4 w-4 ${probeLoading ? "animate-spin" : ""}`} />
-            {probeLoading ? "正在探测服务端真实证书..." : "立即执行无 Schannel 证书探测"}
-          </button>
+          {!isReality && (
+            <button
+              onClick={() => onReprobe(node)}
+              disabled={probeLoading}
+              className="mq-btn mq-btn-primary flex w-full items-center justify-center gap-2 rounded-xl py-2.5 font-semibold disabled:opacity-50"
+            >
+              <RefreshCw className={`h-4 w-4 ${probeLoading ? "animate-spin" : ""}`} />
+              {probeLoading ? "正在探测服务端真实证书..." : "立即执行无 Schannel 证书探测"}
+            </button>
+          )}
 
           {probeError && (
             <div
@@ -105,7 +119,7 @@ export function ProbeDrawer({
             </div>
           )}
 
-          {probeResult && (
+          {!isReality && probeResult && (
             <div className="space-y-3">
               {probeResult.outcome.status === "mismatch" && (
                 <div
@@ -216,7 +230,26 @@ export function ProbeDrawer({
             </div>
           )}
 
-          {node.tls.verify_mode.mode === "insecure_legacy" && (
+          {node.tls.verify_mode.mode === "pinned_spki" && (
+            <div
+              className="mt-4 border-t pt-4"
+              style={{ borderColor: "var(--mq-border)" }}
+            >
+              <button
+                onClick={onClearPin}
+                className="mq-btn flex w-full items-center justify-center gap-1.5 rounded-xl border py-2.5 text-xs font-medium"
+                style={{
+                  backgroundColor: "var(--mq-subtle)",
+                  borderColor: "var(--mq-border-strong)",
+                  color: "var(--mq-ink-2)",
+                }}
+              >
+                解除 SPKI 指纹固定（恢复系统 CA 校验）
+              </button>
+            </div>
+          )}
+
+          {!isReality && node.tls.verify_mode.mode === "insecure_legacy" && (
             <div
               className="mt-4 border-t pt-4"
               style={{ borderColor: "var(--mq-border)" }}

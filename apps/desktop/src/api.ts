@@ -71,6 +71,9 @@ export const api = {
   confirmNodePin: (nodeId: string, trustRecord: TrustRecord) =>
     invoke<NodeConfig>("confirm_node_pin", { nodeId, trustRecord }),
 
+  clearNodePin: (nodeId: string) =>
+    invoke<NodeConfig>("clear_node_pin", { nodeId }),
+
   setInsecureOverride: (nodeId: string, confirmed: boolean) =>
     invoke<NodeConfig>("set_insecure_override", { nodeId, confirmed }),
 

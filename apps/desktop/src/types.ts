@@ -21,12 +21,18 @@ export interface TrustRecord {
   origin: "tofu_probe" | "verified_imported_pin" | "manual";
 }
 
+export interface RealityConfig {
+  public_key: string;
+  short_id: string;
+}
+
 export interface TlsConfig {
   enabled: boolean;
   server_name?: string;
   disable_sni: boolean;
   alpn: string[];
   utls_fingerprint?: string;
+  reality?: RealityConfig;
   verify_mode: TlsVerifyMode;
   imported_cert_sha256_hex?: string;
   verify_peer_name?: string;
@@ -164,11 +170,15 @@ export interface TunServiceStatus {
   last_mitm_alert?: string;
   version?: string;
   last_error?: string;
+  active_profile_id?: string;
+  active_node_id?: string;
+  active_node_name?: string;
 }
 
 export interface RuntimeStatus {
   running: boolean;
   pid?: number;
+  active_profile_id?: string;
   active_node_id?: string;
   active_node_name?: string;
   clash_api_port?: number;

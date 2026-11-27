@@ -228,31 +228,34 @@ export function ImportModal({
                   <div className="font-medium" style={{ color: "var(--mq-ink)" }}>
                     `[Host]` 域名别名隔离审批（默认全禁用）：
                   </div>
-                  {preview.hosts.map((h) => (
-                    <label
-                      key={h.domain}
-                      className="flex cursor-pointer items-center justify-between rounded-lg border px-3 py-2"
-                      style={{ backgroundColor: "var(--mq-card)", borderColor: "var(--mq-border)" }}
-                    >
-                      <span className="font-mono-tabular" style={{ color: "var(--mq-ink)" }}>
-                        {h.domain} → {h.target}{" "}
-                        <span className="text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
-                          ({h.classification})
+                  {preview.hosts.map((h, idx) => {
+                    const hostKey = `${h.domain.trim().toLowerCase()}||${h.target.trim()}`;
+                    return (
+                      <label
+                        key={`${hostKey}-${idx}`}
+                        className="flex cursor-pointer items-center justify-between rounded-lg border px-3 py-2"
+                        style={{ backgroundColor: "var(--mq-card)", borderColor: "var(--mq-border)" }}
+                      >
+                        <span className="font-mono-tabular" style={{ color: "var(--mq-ink)" }}>
+                          {h.domain} → {h.target}{" "}
+                          <span className="text-[11px]" style={{ color: "var(--mq-ink-3)" }}>
+                            ({h.classification})
+                          </span>
                         </span>
-                      </span>
-                      <input
-                        type="checkbox"
-                        checked={approvedHostDomains.has(h.domain)}
-                        onChange={(e) => {
-                          const next = new Set(approvedHostDomains);
-                          if (e.target.checked) next.add(h.domain);
-                          else next.delete(h.domain);
-                          setApprovedHostDomains(next);
-                        }}
-                        className="h-4 w-4 accent-[var(--mq-accent)]"
-                      />
-                    </label>
-                  ))}
+                        <input
+                          type="checkbox"
+                          checked={approvedHostDomains.has(hostKey)}
+                          onChange={(e) => {
+                            const next = new Set(approvedHostDomains);
+                            if (e.target.checked) next.add(hostKey);
+                            else next.delete(hostKey);
+                            setApprovedHostDomains(next);
+                          }}
+                          className="h-4 w-4 accent-[var(--mq-accent)]"
+                        />
+                      </label>
+                    );
+                  })}
                 </div>
               )}
 

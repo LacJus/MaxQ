@@ -102,6 +102,14 @@ function tlsBadge(node: NodeConfig) {
       icon: Globe,
     };
   }
+  if (node.tls.reality) {
+    return {
+      label: "Reality 公钥",
+      bg: "var(--mq-ok-bg)",
+      color: "var(--mq-ok)",
+      icon: ShieldCheck,
+    };
+  }
   switch (node.tls.verify_mode.mode) {
     case "pinned_spki":
       return {
@@ -150,7 +158,7 @@ const DEFAULT_ABOUT: AboutInfo = {
   os: "windows",
   arch: "x86_64",
   builtin_rule_count: 8581,
-  service_protocol_version: "1.0.3",
+  service_protocol_version: "1.0.4",
   total_profiles: 0,
   total_nodes: 0,
   pinned_spki_nodes: 0,
@@ -249,6 +257,8 @@ export default function App() {
   const wasRunningRef = useRef(false);
   const userStopRef = useRef(false);
   const tabRef = useRef<Tab>(tab);
+  const lastPollWallMsRef = useRef<number>(Date.now());
+  const hiddenTickCounterRef = useRef<number>(0);
 
   // Import Modal State
   const [importOpen, setImportOpen] = useState(false);
@@ -369,13 +379,47 @@ export default function App() {
   }, [tab, inTauri]);
 
   // Real-time Rust polling for runtime status, TUN service, live Clash API telemetry, and (on Logs tab) logs
+  // Includes visibility-aware background throttling & sleep/wake clock-jump stale-connection reset (P2-1).
   useEffect(() => {
     refreshAll();
     if (!inTauri) return;
-    const timer = setInterval(async () => {
+
+    const runPollTick = async (forceVisible = false) => {
       if (pollInFlightRef.current) return;
+      const nowWall = Date.now();
+      const elapsedWall = nowWall - lastPollWallMsRef.current;
+      lastPollWallMsRef.current = nowWall;
+
+      const isHidden = !forceVisible && typeof document !== "undefined" && document.visibilityState === "hidden";
+      if (isHidden) {
+        hiddenTickCounterRef.current += 1;
+        // While minimized/hidden, run only a lightweight status check every 3rd tick (~5.4s)
+        // to minimize background WebView/IPC wakeups while preserving crash auto-heal.
+        if (hiddenTickCounterRef.current % 3 !== 0) {
+          return;
+        }
+      } else {
+        hiddenTickCounterRef.current = 0;
+      }
+
       pollInFlightRef.current = true;
       try {
+        if (isHidden) {
+          const st = await api.getRuntimeStatus();
+          if (wasRunningRef.current && !st.running && !userStopRef.current && !proxyBusyRef.current) {
+            showToast(
+              "err",
+              "检测到代理内核意外退出，MaxQ 已自动关闭 Windows 系统代理以保护正常联网，请前往「运行日志」排查原因。"
+            );
+          }
+          wasRunningRef.current = st.running;
+          if (!st.running) {
+            userStopRef.current = false;
+          }
+          setStatus(st);
+          return;
+        }
+
         const shouldPollLogs = tabRef.current === "logs";
         const [st, tunSt, tel, l] = await Promise.all([
           api.getRuntimeStatus(),
@@ -383,6 +427,12 @@ export default function App() {
           api.getRuntimeTelemetry(),
           shouldPollLogs ? api.getRuntimeLogs() : Promise.resolve(null),
         ]);
+
+        // System sleep/hibernation wake-up detection: flush dead QUIC/AnyTLS/DoH socket pools immediately
+        if (elapsedWall > 8000 && st.running) {
+          api.closeAllConnections().catch(() => {});
+        }
+
         if (wasRunningRef.current && !st.running && !userStopRef.current && !proxyBusyRef.current) {
           showToast(
             "err",
@@ -411,8 +461,23 @@ export default function App() {
       } finally {
         pollInFlightRef.current = false;
       }
+    };
+
+    const timer = setInterval(() => {
+      void runPollTick(false);
     }, 1800);
-    return () => clearInterval(timer);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void runPollTick(true);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProfileId]);
 
@@ -423,6 +488,7 @@ export default function App() {
     const unverified = real.filter(
       (n) =>
         n.tls.enabled &&
+        !n.tls.reality &&
         (n.tls.verify_mode.mode === "insecure_legacy" ||
           n.tls.verify_mode.mode === "pending_pin_bootstrap")
     ).length;
@@ -448,7 +514,19 @@ export default function App() {
     return logs.filter((line) => line.toLowerCase().includes(q));
   }, [logs, logFilter]);
 
+  const tunServiceOutdated = Boolean(
+    inTauri &&
+      tunService.running &&
+      tunService.version &&
+      aboutInfo.service_protocol_version &&
+      tunService.version !== aboutInfo.service_protocol_version
+  );
+
   const applyPolicyChange = async (patch: Partial<RuntimePolicy>, reconnectIfRunning = true) => {
+    if (proxyBusyRef.current) {
+      showToast("info", "代理状态切换中，请稍候...");
+      return;
+    }
     const nextPolicy: RuntimePolicy = { ...policy, ...patch };
     const mp = nextPolicy.mixed_listen_port;
     const cp = nextPolicy.clash_api_port;
@@ -466,12 +544,14 @@ export default function App() {
     }
     setPolicy(nextPolicy);
     if (!inTauri) return;
+    proxyBusyRef.current = true;
     try {
       const saved = await api.updateRuntimePolicy(nextPolicy);
       setPolicy(saved);
-      if (reconnectIfRunning && status.running && profile && status.active_node_id) {
+      const targetProfileId = status.active_profile_id ?? profile?.id;
+      if (reconnectIfRunning && status.running && targetProfileId && status.active_node_id) {
         const st = await api.startProxy(
-          profile.id,
+          targetProfileId,
           status.active_node_id,
           saved.proxy_mode === "system_proxy"
         );
@@ -483,6 +563,8 @@ export default function App() {
       }
     } catch (err) {
       showToast("err", String(err));
+    } finally {
+      proxyBusyRef.current = false;
     }
   };
 
@@ -741,6 +823,10 @@ export default function App() {
     setInspectNode(node);
     setProbeResult(null);
     setProbeError(null);
+    if (node.tls.reality) {
+      setProbeLoading(false);
+      return;
+    }
     setProbeLoading(true);
     try {
       const res = await api.probeNodeCertificate(node.id);
@@ -760,6 +846,19 @@ export default function App() {
       setProbeResult(null);
       await refreshAll();
       showToast("ok", `已为 ${inspectNode.name} 固定 SPKI 公钥指纹`);
+    } catch (err) {
+      showToast("err", String(err));
+    }
+  };
+
+  const handleClearPin = async () => {
+    if (!inspectNode) return;
+    try {
+      await api.clearNodePin(inspectNode.id);
+      setInspectNode(null);
+      setProbeResult(null);
+      await refreshAll();
+      showToast("ok", `已解除 ${inspectNode.name} 的 SPKI 固定并恢复系统 CA 校验`);
     } catch (err) {
       showToast("err", String(err));
     }
@@ -1158,15 +1257,31 @@ export default function App() {
               {theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
             </button>
 
-            {!tunService.running && inTauri && (
+            {(!tunService.running || tunServiceOutdated) && inTauri && (
               <button
                 onClick={handleInstallTunService}
                 disabled={tunBusy}
                 className="mq-btn mq-subtle flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium disabled:opacity-50"
-                style={{ color: "var(--mq-ink)" }}
+                style={
+                  tunServiceOutdated
+                    ? {
+                        backgroundColor: "var(--mq-warn-bg)",
+                        color: "var(--mq-warn)",
+                      }
+                    : { color: "var(--mq-ink)" }
+                }
               >
-                <Cpu className="h-3.5 w-3.5" style={{ color: "var(--mq-accent)" }} />
-                {tunBusy ? "安装中..." : "安装 TUN 服务"}
+                <Cpu
+                  className="h-3.5 w-3.5"
+                  style={{ color: tunServiceOutdated ? "var(--mq-warn)" : "var(--mq-accent)" }}
+                />
+                {tunBusy
+                  ? tunServiceOutdated
+                    ? "升级中..."
+                    : "安装中..."
+                  : tunServiceOutdated
+                  ? "升级 TUN 服务"
+                  : "安装 TUN 服务"}
               </button>
             )}
 
@@ -1474,15 +1589,16 @@ export default function App() {
                             </span>
 
                             <div className="flex items-center gap-1.5">
-                              {node.tls.enabled && (
-                                <button
-                                  onClick={() => handleProbeNode(node)}
-                                  className="mq-btn mq-subtle rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                                  style={{ color: "var(--mq-ink-2)" }}
-                                >
-                                  证书探测
-                                </button>
-                              )}
+                              {node.tls.enabled &&
+                                (!node.tls.reality || node.tls.verify_mode.mode === "pinned_spki") && (
+                                  <button
+                                    onClick={() => handleProbeNode(node)}
+                                    className="mq-btn mq-subtle rounded-lg px-2.5 py-1.5 text-xs font-medium"
+                                    style={{ color: "var(--mq-ink-2)" }}
+                                  >
+                                    {node.tls.reality ? "解除固定" : "证书探测"}
+                                  </button>
+                                )}
                               {isActive ? (
                                 <button
                                   onClick={handleStopProxy}
@@ -1543,14 +1659,18 @@ export default function App() {
                       <span
                         className="rounded-full px-2.5 py-0.5 text-[11px] font-semibold"
                         style={
-                          tunService.running
+                          tunServiceOutdated
+                            ? { backgroundColor: "var(--mq-warn-bg)", color: "var(--mq-warn)" }
+                            : tunService.running
                             ? { backgroundColor: "var(--mq-ok-bg)", color: "var(--mq-ok)" }
                             : tunService.installed
                             ? { backgroundColor: "var(--mq-warn-bg)", color: "var(--mq-warn)" }
                             : { backgroundColor: "var(--mq-subtle)", color: "var(--mq-ink-3)" }
                         }
                       >
-                        {tunService.running
+                        {tunServiceOutdated
+                          ? `需升级 (v${tunService.version} → v${aboutInfo.service_protocol_version})`
+                          : tunService.running
                           ? "服务运行中"
                           : tunService.installed
                           ? "已安装 · 未运行"
@@ -1585,17 +1705,45 @@ export default function App() {
                           : "安装并启动 TUN 服务 (UAC)"}
                       </button>
                     ) : (
-                      <button
-                        onClick={handleUninstallTunService}
-                        disabled={tunBusy}
-                        className="mq-btn rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
-                        style={{ backgroundColor: "var(--mq-danger-bg)", color: "var(--mq-danger)" }}
-                      >
-                        {tunBusy ? "卸载中..." : "卸载 TUN 服务 (UAC)"}
-                      </button>
+                      <>
+                        {tunServiceOutdated && (
+                          <button
+                            onClick={handleInstallTunService}
+                            disabled={tunBusy}
+                            className="mq-btn mq-btn-primary rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                          >
+                            {tunBusy ? "升级中（等待 UAC）..." : "升级 TUN 服务 (UAC)"}
+                          </button>
+                        )}
+                        <button
+                          onClick={handleUninstallTunService}
+                          disabled={tunBusy}
+                          className="mq-btn rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                          style={{ backgroundColor: "var(--mq-danger-bg)", color: "var(--mq-danger)" }}
+                        >
+                          {tunBusy ? "卸载中..." : "卸载 TUN 服务 (UAC)"}
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
+
+                {tunServiceOutdated && (
+                  <div
+                    className="mt-3 rounded-xl border px-3.5 py-2.5 text-xs"
+                    style={{
+                      backgroundColor: "var(--mq-warn-bg)",
+                      borderColor: "var(--mq-warn-border)",
+                      color: "var(--mq-warn)",
+                    }}
+                  >
+                    <span className="font-semibold">检测到旧版 TUN 服务：</span>
+                    当前后台服务协议为{" "}
+                    <code className="font-mono-tabular">v{tunService.version}</code>，客户端要求{" "}
+                    <code className="font-mono-tabular">v{aboutInfo.service_protocol_version}</code>
+                    。请点击右上角「升级 TUN 服务 (UAC)」以应用最新安全与性能修复。
+                  </div>
+                )}
 
                 {tunService.last_error && !tunService.running && (
                   <div
@@ -2082,6 +2230,7 @@ export default function App() {
         onClose={() => setInspectNode(null)}
         onReprobe={handleProbeNode}
         onConfirmPin={handleConfirmPin}
+        onClearPin={handleClearPin}
         onTemporaryOverride={handleTemporaryOverride}
       />
 
