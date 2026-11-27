@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use maxq_core_model::{
     DangerousOverrideCapture, Hysteria2Obfs, ImportFormat, NodeConfig, ProtocolConfig,
-    RawImportBundle, RealityConfig, TlsConfig, TlsVerifyMode,
+    RawImportBundle, RealityConfig, TlsConfig, TlsVerifyMode, TransportConfig,
 };
 use serde_json::Value;
 
-use crate::ParseError;
+use crate::{normalize_node, ParseError};
 
 /// Safely imports proxy outbounds from an external `sing-box` JSON file while blocking
 /// external `inbounds`, `experimental.clash_api`, `log.output`, and local filesystem path injections.
@@ -142,6 +144,98 @@ fn jstr<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty())
 }
 
+fn jduration(v: &Value, k: &str) -> Option<String> {
+    let raw = v.get(k)?;
+    if let Some(s) = raw.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    } else if let Some(n) = raw.as_u64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
+fn parse_singbox_transport(v: &Value) -> TransportConfig {
+    let Some(t) = v.get("transport") else {
+        return TransportConfig::Tcp;
+    };
+    let ttype = jstr(t, "type")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match ttype.as_str() {
+        "ws" | "websocket" => {
+            let path = jstr(t, "path").unwrap_or("/").to_string();
+            let mut headers = BTreeMap::new();
+            if let Some(hmap) = t.get("headers").and_then(|h| h.as_object()) {
+                for (k, val) in hmap {
+                    let k_t = k.trim();
+                    if k_t.is_empty() {
+                        continue;
+                    }
+                    if let Some(s) = val.as_str() {
+                        if !s.trim().is_empty() {
+                            headers.insert(k_t.to_string(), s.trim().to_string());
+                        }
+                    } else if let Some(arr) = val.as_array() {
+                        let joined: Vec<&str> = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !joined.is_empty() {
+                            headers.insert(k_t.to_string(), joined.join(", "));
+                        }
+                    }
+                }
+            }
+            let max_early_data = t
+                .get("max_early_data")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as u32);
+            let early_data_header_name = jstr(t, "early_data_header_name").map(str::to_string);
+            TransportConfig::Ws {
+                path,
+                headers,
+                max_early_data,
+                early_data_header_name,
+            }
+        }
+        "grpc" => TransportConfig::Grpc {
+            service_name: jstr(t, "service_name").unwrap_or_default().to_string(),
+        },
+        "httpupgrade" => TransportConfig::HttpUpgrade {
+            path: jstr(t, "path").unwrap_or("/").to_string(),
+            host: jstr(t, "host").map(str::to_string),
+        },
+        "http" => {
+            let path = jstr(t, "path").map(str::to_string);
+            let mut host = Vec::new();
+            if let Some(h) = t.get("host") {
+                if let Some(s) = h.as_str() {
+                    if !s.is_empty() {
+                        host.push(s.to_string());
+                    }
+                } else if let Some(arr) = h.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if !s.is_empty() {
+                                host.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            let method = jstr(t, "method").map(str::to_string);
+            TransportConfig::Http { path, host, method }
+        }
+        _ => TransportConfig::Tcp,
+    }
+}
+
 fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
     let ob_type = jstr(v, "type").ok_or("missing type")?;
     let name = jstr(v, "tag").unwrap_or("unnamed").to_string();
@@ -158,8 +252,8 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
         },
         "anytls" => ProtocolConfig::AnyTls {
             password: jstr(v, "password").ok_or("missing password")?.to_string(),
-            idle_session_check_interval: jstr(v, "idle_session_check_interval").map(str::to_string),
-            idle_session_timeout: jstr(v, "idle_session_timeout").map(str::to_string),
+            idle_session_check_interval: jduration(v, "idle_session_check_interval"),
+            idle_session_timeout: jduration(v, "idle_session_timeout"),
             min_idle_session: v
                 .get("min_idle_session")
                 .and_then(|x| x.as_u64())
@@ -187,7 +281,7 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
             ProtocolConfig::Hysteria2 {
                 password: jstr(v, "password").ok_or("missing password")?.to_string(),
                 server_ports,
-                hop_interval: jstr(v, "hop_interval").map(str::to_string),
+                hop_interval: jduration(v, "hop_interval"),
                 up_mbps: v.get("up_mbps").and_then(|x| x.as_u64()).map(|n| n as u32),
                 down_mbps: v
                     .get("down_mbps")
@@ -205,7 +299,7 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
                 .get("zero_rtt_handshake")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
-            heartbeat: jstr(v, "heartbeat").map(str::to_string),
+            heartbeat: jduration(v, "heartbeat"),
         },
         "vless" => ProtocolConfig::Vless {
             uuid: jstr(v, "uuid").ok_or("missing uuid")?.to_string(),
@@ -240,6 +334,13 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
                 None
             }
         });
+        let utls_fingerprint = tls.get("utls").and_then(|u| {
+            if u.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true) {
+                jstr(u, "fingerprint").map(str::to_string)
+            } else {
+                None
+            }
+        });
         node.tls = TlsConfig {
             enabled,
             server_name: jstr(tls, "server_name").map(str::to_string),
@@ -256,10 +357,7 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            utls_fingerprint: tls
-                .get("utls")
-                .and_then(|u| jstr(u, "fingerprint"))
-                .map(str::to_string),
+            utls_fingerprint,
             reality,
             verify_mode: if insecure {
                 TlsVerifyMode::InsecureLegacy {
@@ -271,6 +369,7 @@ fn parse_outbound(v: &Value) -> Result<NodeConfig, String> {
             ..Default::default()
         };
     }
-
+    node.transport = parse_singbox_transport(v);
+    normalize_node(&mut node);
     Ok(node)
 }

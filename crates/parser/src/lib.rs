@@ -251,3 +251,91 @@ pub(crate) fn normalize_port_ranges(raw: &str) -> Vec<String> {
         })
         .collect()
 }
+
+/// Strips surrounding whitespace and IPv6 literal brackets (`[` / `]`).
+pub(crate) fn strip_ipv6_brackets(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_string()
+}
+
+/// Normalizes VMess cipher aliases (e.g. `chacha20-ietf-poly1305` -> `chacha20-poly1305`)
+/// and lowercases standard cipher names (`auto`, `aes-128-gcm`, `chacha20-poly1305`, `none`, `zero`).
+pub(crate) fn normalize_vmess_security(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "" => "auto".to_string(),
+        "chacha20-ietf-poly1305" => "chacha20-poly1305".to_string(),
+        _ => lower,
+    }
+}
+
+/// Normalizes numeric-only duration strings (e.g. `"10"`, `"30"`) by appending `"s"` -> `"10s"`, `"30s"`.
+pub(crate) fn normalize_duration_seconds(raw: Option<String>) -> Option<String> {
+    let s = raw?.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("{s}s"))
+    } else {
+        Some(s)
+    }
+}
+
+fn normalize_lowercase_opt(raw: Option<String>) -> Option<String> {
+    let s = raw?.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Applies canonical cross-dialect normalization to a parsed `NodeConfig`:
+/// - Strips IPv6 brackets `[...]` from `server` and `tls.server_name`
+/// - Normalizes VMess `security` (`chacha20-ietf-poly1305` -> `chacha20-poly1305`, lowercase)
+/// - Lowercases TUIC `congestion_control` & `udp_relay_mode`
+/// - Lowercases `tls.utls_fingerprint`
+/// - Appends `"s"` to numeric-only duration strings (`heartbeat`, `hop_interval`, AnyTLS idle timers)
+pub fn normalize_node(node: &mut maxq_core_model::NodeConfig) {
+    node.server = strip_ipv6_brackets(&node.server);
+    node.tls.server_name = node
+        .tls
+        .server_name
+        .take()
+        .map(|s| strip_ipv6_brackets(&s))
+        .filter(|s| !s.is_empty());
+    node.tls.utls_fingerprint = normalize_lowercase_opt(node.tls.utls_fingerprint.take());
+
+    match &mut node.protocol {
+        maxq_core_model::ProtocolConfig::Vmess { security, .. } => {
+            *security = normalize_vmess_security(security);
+        }
+        maxq_core_model::ProtocolConfig::Tuic {
+            congestion_control,
+            udp_relay_mode,
+            heartbeat,
+            ..
+        } => {
+            *congestion_control = normalize_lowercase_opt(congestion_control.take());
+            *udp_relay_mode = normalize_lowercase_opt(udp_relay_mode.take());
+            *heartbeat = normalize_duration_seconds(heartbeat.take());
+        }
+        maxq_core_model::ProtocolConfig::Hysteria2 { hop_interval, .. } => {
+            *hop_interval = normalize_duration_seconds(hop_interval.take());
+        }
+        maxq_core_model::ProtocolConfig::AnyTls {
+            idle_session_check_interval,
+            idle_session_timeout,
+            ..
+        } => {
+            *idle_session_check_interval =
+                normalize_duration_seconds(idle_session_check_interval.take());
+            *idle_session_timeout = normalize_duration_seconds(idle_session_timeout.take());
+        }
+        _ => {}
+    }
+}

@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use maxq_core_model::{
     DangerousSectionCapture, DialOptions, Hysteria2Obfs, ImportFormat, NodeConfig, ProtocolConfig,
     RawHostEntry, RawImportBundle, RuleAction, RuleEntry, RuleMatch, TlsConfig, TlsVerifyMode,
+    TransportConfig,
 };
 
 use crate::{
-    extract_conf_section_header, normalize_hex_sha256_pin, normalize_port_ranges,
+    extract_conf_section_header, normalize_hex_sha256_pin, normalize_node, normalize_port_ranges,
     normalize_section_key, ParseError,
 };
 
@@ -239,7 +240,10 @@ fn parse_proxy_line(line: &str, bundle: &mut RawImportBundle) -> Result<(), Stri
                 ProtocolConfig::Hysteria2 {
                     password,
                     server_ports,
-                    hop_interval: kv.get("hop-interval").cloned(),
+                    hop_interval: kv
+                        .get("hop-interval")
+                        .or_else(|| kv.get("hop_interval"))
+                        .cloned(),
                     up_mbps: kv.get("up").and_then(|v| v.parse().ok()),
                     down_mbps: kv.get("down").and_then(|v| v.parse().ok()),
                     obfs,
@@ -256,13 +260,23 @@ fn parse_proxy_line(line: &str, bundle: &mut RawImportBundle) -> Result<(), Stri
                 ProtocolConfig::Tuic {
                     uuid,
                     password: kv.get("password").cloned(),
-                    congestion_control: kv.get("congestion-controller").cloned(),
-                    udp_relay_mode: kv.get("udp-relay-mode").cloned(),
+                    congestion_control: kv
+                        .get("congestion-controller")
+                        .or_else(|| kv.get("congestion_control"))
+                        .cloned(),
+                    udp_relay_mode: kv
+                        .get("udp-relay-mode")
+                        .or_else(|| kv.get("udp_relay_mode"))
+                        .cloned(),
                     zero_rtt_handshake: kv
                         .get("reduce-rtt")
+                        .or_else(|| kv.get("zero-rtt-handshake"))
                         .map(|v| parse_bool(v))
                         .unwrap_or(false),
-                    heartbeat: kv.get("heartbeat-interval").cloned(),
+                    heartbeat: kv
+                        .get("heartbeat-interval")
+                        .or_else(|| kv.get("heartbeat"))
+                        .cloned(),
                 },
                 true,
             )
@@ -275,6 +289,7 @@ fn parse_proxy_line(line: &str, bundle: &mut RawImportBundle) -> Result<(), Stri
                 .ok_or_else(|| "vmess missing username/uuid".to_string())?;
             let security = kv
                 .get("encrypt-method")
+                .or_else(|| kv.get("cipher"))
                 .cloned()
                 .unwrap_or_else(|| "auto".into());
             (
@@ -315,7 +330,9 @@ fn parse_proxy_line(line: &str, bundle: &mut RawImportBundle) -> Result<(), Stri
                 .cloned()
                 .or_else(|| positional.get(1).cloned())
                 .ok_or_else(|| "ss missing password".to_string())?;
-            let (plugin, plugin_opts) = if let Some(obfs) = kv.get("obfs") {
+            let (plugin, plugin_opts) = if let Some(plugin_name) = kv.get("plugin") {
+                (Some(plugin_name.clone()), kv.get("plugin-opts").cloned())
+            } else if let Some(obfs) = kv.get("obfs") {
                 let opts = kv
                     .get("obfs-host")
                     .map(|h| format!("obfs={obfs};obfs-host={h}"))
@@ -343,21 +360,124 @@ fn parse_proxy_line(line: &str, bundle: &mut RawImportBundle) -> Result<(), Stri
     } else {
         kv.get("tls").map(|s| parse_bool(s)).unwrap_or(false)
     };
+    let alpn = kv
+        .get("alpn")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let utls_fingerprint = kv
+        .get("fp")
+        .or_else(|| kv.get("client-fingerprint"))
+        .cloned()
+        .filter(|s| !s.is_empty());
+
+    let transport = match &protocol {
+        ProtocolConfig::Shadowsocks { .. }
+        | ProtocolConfig::Hysteria2 { .. }
+        | ProtocolConfig::Tuic { .. } => TransportConfig::Tcp,
+        _ => parse_shadowrocket_transport(&kv),
+    };
+
     let mut node = NodeConfig::new(name, host, port, protocol);
     node.tls = TlsConfig {
         enabled: tls_enabled,
         server_name: sni,
+        alpn,
+        utls_fingerprint,
         verify_mode,
         imported_cert_sha256_hex,
         ..Default::default()
     };
+    node.transport = transport;
     node.dial = DialOptions {
         tcp_fast_open: kv.get("tfo").map(|v| parse_bool(v)).unwrap_or(false),
         udp_relay: kv.get("udp-relay").map(|v| parse_bool(v)).unwrap_or(false),
     };
+    normalize_node(&mut node);
 
     bundle.nodes.push(node);
     Ok(())
+}
+
+fn parse_shadowrocket_transport(kv: &HashMap<String, String>) -> TransportConfig {
+    let obfs = kv
+        .get("obfs")
+        .or_else(|| kv.get("network"))
+        .or_else(|| kv.get("type"))
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let is_ws_flag = kv.get("ws").is_some_and(|v| parse_bool(v));
+
+    match obfs.as_deref() {
+        Some("websocket" | "ws") => build_sr_ws_transport(kv),
+        Some("grpc") => {
+            let service_name = kv
+                .get("servicename")
+                .or_else(|| kv.get("service-name"))
+                .or_else(|| kv.get("grpc-service-name"))
+                .or_else(|| kv.get("path"))
+                .cloned()
+                .unwrap_or_default();
+            TransportConfig::Grpc { service_name }
+        }
+        Some("httpupgrade") => {
+            let path = kv
+                .get("path")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "/".to_string());
+            let host = kv
+                .get("obfsparam")
+                .or_else(|| kv.get("obfs-param"))
+                .or_else(|| kv.get("host"))
+                .filter(|s| !s.is_empty())
+                .cloned();
+            TransportConfig::HttpUpgrade { path, host }
+        }
+        _ if is_ws_flag => build_sr_ws_transport(kv),
+        _ => TransportConfig::Tcp,
+    }
+}
+
+fn build_sr_ws_transport(kv: &HashMap<String, String>) -> TransportConfig {
+    let path = kv
+        .get("path")
+        .or_else(|| kv.get("ws-path"))
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
+    let mut headers = BTreeMap::new();
+    if let Some(ws_headers) = kv.get("ws-headers").filter(|s| !s.is_empty()) {
+        for pair in ws_headers.split('|') {
+            if let Some((k, v)) = pair.split_once(':') {
+                let kt = k.trim();
+                let vt = v.trim();
+                if !kt.is_empty() && !vt.is_empty() {
+                    headers.insert(kt.to_string(), vt.to_string());
+                }
+            }
+        }
+    }
+    if !headers.contains_key("Host") {
+        if let Some(host) = kv
+            .get("obfsparam")
+            .or_else(|| kv.get("obfs-param"))
+            .or_else(|| kv.get("host"))
+            .filter(|s| !s.is_empty())
+        {
+            headers.insert("Host".to_string(), host.clone());
+        }
+    }
+    TransportConfig::Ws {
+        path,
+        headers,
+        max_early_data: None,
+        early_data_header_name: None,
+    }
 }
 
 fn parse_rule_line(line: &str) -> Option<RuleEntry> {

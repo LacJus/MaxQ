@@ -32,16 +32,18 @@ pub fn parse_share_link(raw: &str) -> Result<NodeConfig, ParseError> {
         .ok_or_else(|| ParseError::UnsupportedScheme(line.to_string()))?;
     let scheme = scheme_raw.to_ascii_lowercase();
 
-    match scheme.as_str() {
-        "trojan" => parse_trojan(line),
-        "vless" => parse_vless(line),
-        "vmess" => parse_vmess(line),
-        "anytls" => parse_anytls(line),
-        "hysteria2" | "hy2" => parse_hysteria2(line, &scheme),
-        "tuic" => parse_tuic(line),
-        "ss" => parse_shadowsocks(line),
-        _ => Err(ParseError::UnsupportedScheme(scheme)),
-    }
+    let mut node = match scheme.as_str() {
+        "trojan" => parse_trojan(line)?,
+        "vless" => parse_vless(line)?,
+        "vmess" => parse_vmess(line)?,
+        "anytls" => parse_anytls(line)?,
+        "hysteria2" | "hy2" => parse_hysteria2(line, &scheme)?,
+        "tuic" => parse_tuic(line)?,
+        "ss" => parse_shadowsocks(line)?,
+        _ => return Err(ParseError::UnsupportedScheme(scheme)),
+    };
+    crate::normalize_node(&mut node);
+    Ok(node)
 }
 
 fn parse_query_map(url: &Url) -> HashMap<String, String> {

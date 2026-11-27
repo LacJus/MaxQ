@@ -287,3 +287,224 @@ fn rejects_oversized_import_payloads() {
     let err = parse_input(&huge).unwrap_err();
     assert!(matches!(err, maxq_parser::ParseError::InputTooLarge { .. }));
 }
+
+#[test]
+fn parses_ws_grpc_httpupgrade_transports_and_normalizes_dialects_in_clash_yaml() {
+    let yaml = r#"
+proxies:
+  - name: "VMess-WS"
+    type: vmess
+    server: "[2001:db8::1]"
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    alterId: 0
+    cipher: ChaCha20-IETF-Poly1305
+    tls: true
+    servername: "[2001:db8::1]"
+    client-fingerprint: Chrome
+    network: ws
+    ws-opts:
+      path: /v2ws
+      headers:
+        Host: cdn.example.com
+      max-early-data: 2048
+      early-data-header-name: Sec-WebSocket-Protocol
+  - name: "VLESS-gRPC"
+    type: vless
+    server: grpc.example.com
+    port: 443
+    uuid: 22222222-2222-4222-8222-222222222222
+    tls: true
+    network: grpc
+    grpc-opts:
+      grpc-service-name: myGrpcSvc
+  - name: "Trojan-HttpUpgrade"
+    type: trojan
+    server: hu.example.com
+    port: 443
+    password: secret
+    network: httpupgrade
+    httpupgrade-opts:
+      path: /upgrade
+      host: hu-cdn.example.com
+  - name: "TUIC-Norm"
+    type: tuic
+    server: tuic.example.com
+    port: 443
+    uuid: 33333333-3333-4333-8333-333333333333
+    password: pw
+    congestion-controller: BBR
+    udp-relay-mode: Native
+    heartbeat-interval: 10000
+"#;
+    let raw = parse_input(yaml).expect("parse clash yaml");
+    assert_eq!(raw.nodes.len(), 4);
+
+    // 1. VMess WS + normalization
+    let n0 = &raw.nodes[0];
+    assert_eq!(n0.server, "2001:db8::1");
+    assert_eq!(n0.tls.server_name.as_deref(), Some("2001:db8::1"));
+    assert_eq!(n0.tls.utls_fingerprint.as_deref(), Some("chrome"));
+    assert!(matches!(
+        &n0.protocol,
+        ProtocolConfig::Vmess { security, .. } if security == "chacha20-poly1305"
+    ));
+    match &n0.transport {
+        TransportConfig::Ws {
+            path,
+            headers,
+            max_early_data,
+            early_data_header_name,
+        } => {
+            assert_eq!(path, "/v2ws");
+            assert_eq!(headers.get("Host").map(String::as_str), Some("cdn.example.com"));
+            assert_eq!(*max_early_data, Some(2048));
+            assert_eq!(
+                early_data_header_name.as_deref(),
+                Some("Sec-WebSocket-Protocol")
+            );
+        }
+        other => panic!("expected Ws transport, got {other:?}"),
+    }
+
+    // 2. VLESS gRPC
+    assert!(matches!(
+        &raw.nodes[1].transport,
+        TransportConfig::Grpc { service_name } if service_name == "myGrpcSvc"
+    ));
+
+    // 3. Trojan HttpUpgrade
+    assert!(matches!(
+        &raw.nodes[2].transport,
+        TransportConfig::HttpUpgrade { path, host }
+            if path == "/upgrade" && host.as_deref() == Some("hu-cdn.example.com")
+    ));
+
+    // 4. TUIC normalized
+    assert!(matches!(
+        &raw.nodes[3].protocol,
+        ProtocolConfig::Tuic {
+            congestion_control: Some(cc),
+            udp_relay_mode: Some(mode),
+            heartbeat: Some(hb),
+            ..
+        } if cc == "bbr" && mode == "native" && hb == "10000ms"
+    ));
+}
+
+#[test]
+fn parses_ws_grpc_httpupgrade_and_normalizes_in_shadowrocket_conf_and_singbox_json() {
+    let sr_conf = r#"
+[Proxy]
+VMess-SR-WS = vmess, [2001:db8::2], 443, username=11111111-1111-4111-8111-111111111111, encrypt-method=chacha20-ietf-poly1305, tls=true, obfs=websocket, obfsParam=ws.example.com, path=/sr-ws, fp=Chrome
+VLESS-SR-gRPC = vless, grpc.example.com, 443, uuid=22222222-2222-4222-8222-222222222222, tls=true, obfs=grpc, serviceName=srGrpc
+Trojan-SR-HU = trojan, hu.example.com, 443, password=pw, obfs=httpupgrade, path=/hu, obfsParam=hu.example.com
+TUIC-SR = tuic, tuic.example.com, 443, uuid=33333333-3333-4333-8333-333333333333, congestion-controller=BBR, udp-relay-mode=QUIC, heartbeat-interval=15
+Hy2-SR = hysteria2, hy2.example.com, 443, password=pw, mport=20000-21000, hop-interval=30
+"#;
+    let raw_sr = parse_input(sr_conf).expect("parse shadowrocket conf");
+    assert_eq!(raw_sr.nodes.len(), 5);
+    assert_eq!(raw_sr.nodes[0].server, "2001:db8::2");
+    assert_eq!(raw_sr.nodes[0].tls.utls_fingerprint.as_deref(), Some("chrome"));
+    assert!(matches!(
+        &raw_sr.nodes[0].protocol,
+        ProtocolConfig::Vmess { security, .. } if security == "chacha20-poly1305"
+    ));
+    assert!(matches!(
+        &raw_sr.nodes[0].transport,
+        TransportConfig::Ws { path, headers, .. }
+            if path == "/sr-ws" && headers.get("Host").map(String::as_str) == Some("ws.example.com")
+    ));
+    assert!(matches!(
+        &raw_sr.nodes[1].transport,
+        TransportConfig::Grpc { service_name } if service_name == "srGrpc"
+    ));
+    assert!(matches!(
+        &raw_sr.nodes[2].transport,
+        TransportConfig::HttpUpgrade { path, host }
+            if path == "/hu" && host.as_deref() == Some("hu.example.com")
+    ));
+    assert!(matches!(
+        &raw_sr.nodes[3].protocol,
+        ProtocolConfig::Tuic {
+            congestion_control: Some(cc),
+            udp_relay_mode: Some(mode),
+            heartbeat: Some(hb),
+            ..
+        } if cc == "bbr" && mode == "quic" && hb == "15s"
+    ));
+    assert!(matches!(
+        &raw_sr.nodes[4].protocol,
+        ProtocolConfig::Hysteria2 {
+            hop_interval: Some(hi),
+            ..
+        } if hi == "30s"
+    ));
+
+    let sb_json = r#"{
+      "outbounds": [
+        {
+          "type": "vmess",
+          "tag": "SB-WS",
+          "server": "[2001:db8::3]",
+          "server_port": 443,
+          "uuid": "11111111-1111-4111-8111-111111111111",
+          "security": "CHACHA20-IETF-POLY1305",
+          "tls": { "enabled": true, "server_name": "sb.example.com", "utls": { "enabled": true, "fingerprint": "Firefox" } },
+          "transport": {
+            "type": "ws",
+            "path": "/sbws",
+            "headers": { "Host": "sb.example.com" },
+            "max_early_data": 1024,
+            "early_data_header_name": "Sec-WebSocket-Protocol"
+          }
+        },
+        {
+          "type": "vless",
+          "tag": "SB-gRPC",
+          "server": "grpc.example.com",
+          "server_port": 443,
+          "uuid": "22222222-2222-4222-8222-222222222222",
+          "tls": { "enabled": true },
+          "transport": { "type": "grpc", "service_name": "sbGrpc" }
+        },
+        {
+          "type": "trojan",
+          "tag": "SB-HU",
+          "server": "hu.example.com",
+          "server_port": 443,
+          "password": "pw",
+          "tls": { "enabled": true },
+          "transport": { "type": "httpupgrade", "path": "/sbhu", "host": "hu.example.com" }
+        }
+      ]
+    }"#;
+    let raw_sb = parse_input(sb_json).expect("parse singbox json");
+    assert_eq!(raw_sb.nodes.len(), 3);
+    assert_eq!(raw_sb.nodes[0].server, "2001:db8::3");
+    assert_eq!(raw_sb.nodes[0].tls.utls_fingerprint.as_deref(), Some("firefox"));
+    assert!(matches!(
+        &raw_sb.nodes[0].protocol,
+        ProtocolConfig::Vmess { security, .. } if security == "chacha20-poly1305"
+    ));
+    assert!(matches!(
+        &raw_sb.nodes[0].transport,
+        TransportConfig::Ws {
+            path,
+            headers,
+            max_early_data: Some(1024),
+            early_data_header_name: Some(hdr),
+        } if path == "/sbws"
+            && headers.get("Host").map(String::as_str) == Some("sb.example.com")
+            && hdr == "Sec-WebSocket-Protocol"
+    ));
+    assert!(matches!(
+        &raw_sb.nodes[1].transport,
+        TransportConfig::Grpc { service_name } if service_name == "sbGrpc"
+    ));
+    assert!(matches!(
+        &raw_sb.nodes[2].transport,
+        TransportConfig::HttpUpgrade { path, host }
+            if path == "/sbhu" && host.as_deref() == Some("hu.example.com")
+    ));
+}

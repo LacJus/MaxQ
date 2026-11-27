@@ -89,6 +89,7 @@ pub struct SanitizedImport {
 
 /// Runtime network & anti-leak settings controlled exclusively by MaxQ (never overridden by imports).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RuntimePolicy {
     pub mixed_listen_port: u16,
     /// Strictly `127.0.0.1` unless user explicitly enables LAN sharing.
@@ -99,16 +100,12 @@ pub struct RuntimePolicy {
     /// Allowed CORS origins for Clash API (never `*`).
     pub clash_api_allowed_origins: Vec<String>,
     /// Enable TUN inbound (requires hardened privileged service on Windows).
-    #[serde(default)]
     pub tun_enabled: bool,
     /// Proxy engine mode: unprivileged System Proxy vs hardened Windows TUN Service.
-    #[serde(default)]
     pub proxy_mode: ProxyMode,
     /// Traffic routing mode: Rule (split routing), Global (all proxy), or Direct.
-    #[serde(default)]
     pub routing_mode: RoutingMode,
     /// Where routing rules come from when `routing_mode == Rule`.
-    #[serde(default)]
     pub rule_source: RuleSource,
     /// IPv6 handling policy for direct-node anti-leak.
     pub ipv6_mode: Ipv6Policy,
@@ -176,5 +173,28 @@ impl Default for RuntimePolicy {
             remote_dns_server: "1.1.1.1".to_string(),
             direct_dns_server: "223.5.5.5".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_policy_deserializes_empty_json_to_default() {
+        let policy: RuntimePolicy =
+            serde_json::from_str("{}").expect("empty JSON must deserialize to RuntimePolicy::default()");
+        assert_eq!(policy, RuntimePolicy::default());
+    }
+
+    #[test]
+    fn runtime_policy_deserializes_partial_legacy_json_with_defaults() {
+        let partial = r#"{"mixed_listen_port": 18080, "allow_lan": true}"#;
+        let policy: RuntimePolicy =
+            serde_json::from_str(partial).expect("partial JSON must fill missing fields from default");
+        let mut expected = RuntimePolicy::default();
+        expected.mixed_listen_port = 18080;
+        expected.allow_lan = true;
+        assert_eq!(policy, expected);
     }
 }

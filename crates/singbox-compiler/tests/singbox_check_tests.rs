@@ -343,3 +343,197 @@ fn builtin_default_rules_and_tun_service_gate_pass_real_singbox_check() {
         .expect("domain DoH + allow_lan TUN config must satisfy hardened win-service validator");
     verify_with_real_singbox(&compiled_doh.json, "domain_doh_tun");
 }
+
+#[test]
+fn audit_fixes_quic_utls_dialect_norm_tun_ipv6_host_and_resolve_pass_real_singbox_check() {
+    use maxq_core_model::{ProxyMode, RoutingMode};
+
+    // 1. [P0-6] Hysteria2 & TUIC with fp=Chrome MUST NOT emit `utls`, and numeric durations/uppercase enums normalize cleanly
+    let hy2_link = "hy2://hy2pw@hy2.example.com:443?sni=hy2.example.com&fp=Chrome&mport=20000-21000&hop_interval=30#Hy2-FP";
+    let tuic_link = "tuic://22222222-2222-4222-8222-222222222222:tuicpw@v6-only.example.com:8443?congestion_control=BBR&udp_relay_mode=Native&heartbeat=10&fp=Chrome&sni=v6-only.example.com#TUIC-Upper";
+
+    let mut policy = RuntimePolicy::default();
+    policy.proxy_mode = ProxyMode::Tun;
+    policy.routing_mode = RoutingMode::Rule;
+    policy.ipv6_mode = Ipv6Policy::BlockToPreventLeak;
+
+    for (tag, link) in [("hy2_no_utls", hy2_link), ("tuic_no_utls", tuic_link)] {
+        let sanitized = sanitize_import(parse_input(link).unwrap());
+        let compiled = compile_singbox_v14(&CompileInput {
+            active_node: &sanitized.nodes[0],
+            rules: &[],
+            general: &GeneralSettings::default(),
+            approved_hosts: &[],
+            policy: &policy,
+        })
+        .unwrap_or_else(|e| panic!("compile failed for {tag}: {e}"));
+
+        // uTLS MUST be absent on QUIC protocols
+        assert!(
+            compiled.json["outbounds"][0]["tls"].get("utls").is_none(),
+            "{tag}: QUIC outbound must NEVER emit tls.utls"
+        );
+        verify_with_real_singbox(&compiled.json, tag);
+
+        let cfg_str = serde_json::to_string(&compiled.json).unwrap();
+        maxq_win_service::validator::validate_service_config(&cfg_str)
+            .expect("TUN config must pass hardened win-service validator");
+    }
+
+    // 2. [P1-6a] TUN uses RFC 2544 198.18.0.1/30 and excludes CGNAT/multicast ranges
+    //    [P1-6b] Pure IPv6 proxy hostname gets dns-direct rule BEFORE AAAA reject + default_domain_resolver prefer_ipv4
+    let sanitized_tuic = sanitize_import(parse_input(tuic_link).unwrap());
+    let compiled_tuic = compile_singbox_v14(&CompileInput {
+        active_node: &sanitized_tuic.nodes[0],
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &policy,
+    })
+    .unwrap();
+
+    assert_eq!(
+        compiled_tuic.json["inbounds"][1]["address"],
+        serde_json::json!(["198.18.0.1/30", "fdfe:dcba:9876::1/126"])
+    );
+    let excluded = compiled_tuic.json["inbounds"][1]["route_exclude_address"]
+        .as_array()
+        .unwrap();
+    for required in ["100.64.0.0/10", "224.0.0.0/4", "ff00::/8"] {
+        assert!(
+            excluded.iter().any(|v| v == required),
+            "missing {required} in route_exclude_address"
+        );
+    }
+
+    let dns_rules = compiled_tuic.json["dns"]["rules"].as_array().unwrap();
+    let proxy_host_idx = dns_rules
+        .iter()
+        .position(|r| {
+            r.get("domain") == Some(&serde_json::json!(["v6-only.example.com"]))
+                && r["server"] == "dns-direct"
+        })
+        .expect("proxy host dns-direct rule must exist");
+    let aaaa_reject_idx = dns_rules
+        .iter()
+        .position(|r| {
+            r.get("query_type") == Some(&serde_json::json!(["AAAA"])) && r["action"] == "reject"
+        })
+        .expect("AAAA reject rule must exist");
+    assert!(
+        proxy_host_idx < aaaa_reject_idx,
+        "proxy host rule must appear BEFORE AAAA reject rule"
+    );
+    assert_eq!(
+        compiled_tuic.json["route"]["default_domain_resolver"],
+        serde_json::json!({
+            "server": "dns-direct",
+            "strategy": "prefer_ipv4"
+        })
+    );
+
+    // 3. [P1-6c] System Proxy mode IP-CIDR matching: `no-resolve` IP-CIDRs stay BEFORE `{"action":"resolve","server":"dns-remote"}`,
+    //    and non-`no-resolve` CN IP-CIDRs follow the single `resolve` rule!
+    let sys_policy = RuntimePolicy::default();
+    let rules = vec![
+        RuleEntry {
+            matcher: RuleMatch::DomainSuffix("google.com".into()),
+            action: RuleAction::Proxy,
+            no_resolve: false,
+        },
+        RuleEntry {
+            matcher: RuleMatch::IpCidr("149.154.160.0/20".into()),
+            action: RuleAction::Proxy,
+            no_resolve: true,
+        },
+        RuleEntry {
+            matcher: RuleMatch::IpCidr("223.5.5.0/24".into()),
+            action: RuleAction::Direct,
+            no_resolve: false,
+        },
+        RuleEntry {
+            matcher: RuleMatch::IpCidr("114.114.114.0/24".into()),
+            action: RuleAction::Direct,
+            no_resolve: false,
+        },
+        RuleEntry {
+            matcher: RuleMatch::Final,
+            action: RuleAction::Proxy,
+            no_resolve: false,
+        },
+    ];
+    let compiled_resolve = compile_singbox_v14(&CompileInput {
+        active_node: &sanitized_tuic.nodes[0],
+        rules: &rules,
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &sys_policy,
+    })
+    .unwrap();
+    let rrules = compiled_resolve.json["route"]["rules"].as_array().unwrap();
+    let no_resolve_ip_idx = rrules
+        .iter()
+        .position(|r| r.get("ip_cidr") == Some(&serde_json::json!(["149.154.160.0/20"])))
+        .expect("no-resolve IP-CIDR rule present");
+    let resolve_indices: Vec<usize> = rrules
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            (r.get("action") == Some(&serde_json::json!("resolve"))
+                && r.get("server") == Some(&serde_json::json!("dns-remote")))
+            .then_some(i)
+        })
+        .collect();
+    assert_eq!(resolve_indices.len(), 1, "must emit exactly one resolve action");
+    let cn_ip_idx = rrules
+        .iter()
+        .position(|r| {
+            r.get("ip_cidr") == Some(&serde_json::json!(["223.5.5.0/24", "114.114.114.0/24"]))
+        })
+        .expect("non-no-resolve CN IP-CIDR group present");
+    assert!(no_resolve_ip_idx < resolve_indices[0]);
+    assert!(resolve_indices[0] < cn_ip_idx);
+    verify_with_real_singbox(&compiled_resolve.json, "system_proxy_resolve_ip_cidr");
+
+    // 4. [P1-2] Compiler defense-in-depth: raw unnormalized VMess chacha20-ietf-poly1305 + bracketed IPv6 + IP-literal SNI with SPKI pin
+    let mut raw_vmess = NodeConfig::new(
+        "Raw-VMess-IPv6",
+        "[2001:db8::42]",
+        443,
+        ProtocolConfig::Vmess {
+            uuid: "44444444-4444-4444-8444-444444444444".into(),
+            alter_id: 0,
+            security: "chacha20-ietf-poly1305".into(),
+        },
+    );
+    raw_vmess.tls.enabled = true;
+    raw_vmess.tls.server_name = Some("[2001:db8::42]".into());
+    raw_vmess.tls.utls_fingerprint = Some("Chrome".into());
+    raw_vmess.tls.verify_mode = TlsVerifyMode::PinnedSpki;
+    raw_vmess.tls.trust_record = Some(mock_trust_record("2001:db8::42"));
+
+    let compiled_vmess = compile_singbox_v14(&CompileInput {
+        active_node: &raw_vmess,
+        rules: &[],
+        general: &GeneralSettings::default(),
+        approved_hosts: &[],
+        policy: &sys_policy,
+    })
+    .unwrap();
+    assert_eq!(compiled_vmess.json["outbounds"][0]["server"], "2001:db8::42");
+    assert_eq!(
+        compiled_vmess.json["outbounds"][0]["security"],
+        "chacha20-poly1305"
+    );
+    assert!(
+        compiled_vmess.json["outbounds"][0]["tls"]
+            .get("server_name")
+            .is_none(),
+        "IP literal must be omitted from tls.server_name"
+    );
+    assert_eq!(
+        compiled_vmess.json["outbounds"][0]["tls"]["utls"]["fingerprint"],
+        "chrome"
+    );
+    verify_with_real_singbox(&compiled_vmess.json, "vmess_ipv6_chacha_spki");
+}

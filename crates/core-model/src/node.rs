@@ -29,6 +29,11 @@ pub struct NodeConfig {
     pub source_tag: Option<String>,
 }
 
+/// Strips surrounding whitespace and IPv6 literal brackets (`[` / `]`) from a host or SNI string.
+fn strip_host_brackets(raw: &str) -> &str {
+    raw.trim().trim_start_matches('[').trim_end_matches(']').trim()
+}
+
 impl NodeConfig {
     pub fn new(
         name: impl Into<String>,
@@ -37,11 +42,13 @@ impl NodeConfig {
         protocol: ProtocolConfig,
     ) -> Self {
         let name = name.into();
+        let server_raw = server.into();
+        let server = strip_host_brackets(&server_raw).to_string();
         let is_metadata_node = detect_metadata_node_name(&name);
         Self {
             id: Uuid::new_v4().to_string(),
             name,
-            server: server.into(),
+            server,
             server_port,
             dial_override_server: None,
             protocol,
@@ -55,18 +62,22 @@ impl NodeConfig {
 
     /// Returns the effective host to dial (approved alias override or canonical `server`).
     pub fn effective_dial_server(&self) -> &str {
-        self.dial_override_server
+        let raw = self
+            .dial_override_server
             .as_deref()
-            .unwrap_or(self.server.as_str())
+            .unwrap_or(self.server.as_str());
+        strip_host_brackets(raw)
     }
 
-    /// Returns the effective TLS SNI (explicit `server_name` or fallback to `server`).
+    /// Returns the effective TLS SNI (explicit `server_name` or fallback to `server`),
+    /// always stripping IPv6 literal brackets and surrounding whitespace.
     pub fn effective_sni(&self) -> &str {
         self.tls
             .server_name
             .as_deref()
+            .map(strip_host_brackets)
             .filter(|s| !s.is_empty())
-            .unwrap_or(self.server.as_str())
+            .unwrap_or_else(|| strip_host_brackets(self.server.as_str()))
     }
 
     /// Whether this protocol uses UDP/QUIC TLS handshake rather than TCP TLS.
@@ -238,4 +249,34 @@ pub struct DialOptions {
     pub tcp_fast_open: bool,
     #[serde(default)]
     pub udp_relay: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_ipv6_brackets_in_constructor_and_effective_sni() {
+        let mut node = NodeConfig::new(
+            "IPv6 Node",
+            "  [2001:db8::1]  ",
+            443,
+            ProtocolConfig::Trojan {
+                password: "pw".into(),
+            },
+        );
+        assert_eq!(node.server, "2001:db8::1");
+        assert_eq!(node.effective_sni(), "2001:db8::1");
+        assert_eq!(node.effective_dial_server(), "2001:db8::1");
+
+        // Bracketed SNI must also be stripped
+        node.tls.server_name = Some(" [2001:db8::2] ".into());
+        assert_eq!(node.effective_sni(), "2001:db8::2");
+
+        // Legacy deserialized bracketed server falls back cleanly when server_name is empty/brackets
+        node.server = "[::1]".into();
+        node.tls.server_name = Some("  ".into());
+        assert_eq!(node.effective_sni(), "::1");
+        assert_eq!(node.effective_dial_server(), "::1");
+    }
 }

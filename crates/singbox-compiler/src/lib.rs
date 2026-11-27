@@ -352,8 +352,11 @@ fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
             "172.16.0.0/12".into(),
             "192.168.0.0/16".into(),
             "169.254.0.0/16".into(),
+            "100.64.0.0/10".into(),
+            "224.0.0.0/4".into(),
             "fc00::/7".into(),
             "fe80::/10".into(),
+            "ff00::/8".into(),
         ];
         // Defense-in-depth (C-2): ONLY allow strictly private/local CIDRs in route_exclude_address
         for cidr in &input.general.tun_excluded_routes {
@@ -366,7 +369,7 @@ fn build_inbounds(input: &CompileInput<'_>) -> Vec<Value> {
             "tag": "tun-in",
             "interface_name": "maxq-tun0",
             "address": [
-                "172.19.0.1/30",
+                "198.18.0.1/30",
                 "fdfe:dcba:9876::1/126"
             ],
             "auto_route": true,
@@ -490,6 +493,16 @@ fn build_dns_section(
     }
 
     if input.policy.ipv6_mode == Ipv6Policy::BlockToPreventLeak {
+        // Allow resolving the active proxy node's own hostname via dns-direct ahead of the AAAA reject rule
+        // (paired with route.default_domain_resolver.strategy = "prefer_ipv4" to avoid pure-IPv6 self-lock
+        // while complying with sing-box v1.14's removal of per-DNS-rule `strategy`).
+        let proxy_host = strip_host_brackets(input.active_node.effective_dial_server());
+        if !proxy_host.is_empty() && proxy_host.parse::<IpAddr>().is_err() {
+            dns_rules.push(json!({
+                "domain": [proxy_host],
+                "server": "dns-direct"
+            }));
+        }
         dns_rules.push(json!({
             "query_type": ["AAAA"],
             "action": "reject"
@@ -562,6 +575,7 @@ enum MatcherCategory {
 struct CoalescedRuleBucket {
     action: Option<RuleAction>,
     category: Option<MatcherCategory>,
+    no_resolve: bool,
     domains: Vec<String>,
     domain_suffixes: Vec<String>,
     domain_keywords: Vec<String>,
@@ -578,14 +592,37 @@ impl CoalescedRuleBucket {
             && self.process_names.is_empty()
     }
 
-    fn flush_into(&mut self, out: &mut Vec<Value>) {
+    fn flush_into(
+        &mut self,
+        out: &mut Vec<Value>,
+        emitted_resolve_action: &mut bool,
+        routing_mode: RoutingMode,
+    ) {
+        let cat = self.category.take();
+        let no_resolve = self.no_resolve;
+        self.no_resolve = false;
         if self.is_empty() {
+            self.action = None;
             return;
         }
         let Some(action) = self.action.take() else {
             return;
         };
-        self.category = None;
+
+        // In sing-box v1.14, ip_cidr rules do NOT implicitly resolve domain targets from mixed-in
+        // unless preceded by an explicit `resolve` action. Emit one `resolve` via `dns-remote`
+        // right before the first non-`no-resolve` IP-CIDR group in Rule mode (zero ISP DNS leak!).
+        if cat == Some(MatcherCategory::IpCidrGroup)
+            && !no_resolve
+            && !*emitted_resolve_action
+            && routing_mode == RoutingMode::Rule
+        {
+            out.push(json!({
+                "action": "resolve",
+                "server": "dns-remote"
+            }));
+            *emitted_resolve_action = true;
+        }
 
         let mut obj = Map::new();
         if !self.domains.is_empty() {
@@ -654,6 +691,7 @@ fn build_route_section(
     };
     let mut final_is_reject = false;
     let mut skipped_rules = 0usize;
+    let mut emitted_resolve_action = false;
     let mut bucket = CoalescedRuleBucket::default();
 
     for rule in effective_rules {
@@ -677,11 +715,25 @@ fn build_route_section(
         };
 
         if let Some(cat) = category {
-            // Flush whenever action OR matcher category changes so sing-box NEVER ANDs incompatible matchers (C-1)
-            if bucket.action.as_ref() != Some(&rule.action) || bucket.category != Some(cat) {
-                bucket.flush_into(&mut route_rules);
+            let rule_no_resolve = if cat == MatcherCategory::IpCidrGroup {
+                rule.no_resolve
+            } else {
+                false
+            };
+            // Flush whenever action, matcher category, or IP-CIDR `no-resolve` changes so sing-box
+            // NEVER ANDs incompatible matchers (C-1) and keeps `no-resolve` rules ahead of `resolve`.
+            if bucket.action.as_ref() != Some(&rule.action)
+                || bucket.category != Some(cat)
+                || bucket.no_resolve != rule_no_resolve
+            {
+                bucket.flush_into(
+                    &mut route_rules,
+                    &mut emitted_resolve_action,
+                    input.policy.routing_mode,
+                );
                 bucket.action = Some(rule.action.clone());
                 bucket.category = Some(cat);
+                bucket.no_resolve = rule_no_resolve;
             }
             match &rule.matcher {
                 RuleMatch::Domain(d) => bucket.domains.push(d.clone()),
@@ -707,7 +759,11 @@ fn build_route_section(
                 if compiled_subs.is_empty() {
                     skipped_rules += 1;
                 } else {
-                    bucket.flush_into(&mut route_rules);
+                    bucket.flush_into(
+                        &mut route_rules,
+                        &mut emitted_resolve_action,
+                        input.policy.routing_mode,
+                    );
                     let mut obj = Map::new();
                     obj.insert("type".into(), json!("logical"));
                     obj.insert("mode".into(), json!("or"));
@@ -723,7 +779,11 @@ fn build_route_section(
         }
     }
 
-    bucket.flush_into(&mut route_rules);
+    bucket.flush_into(
+        &mut route_rules,
+        &mut emitted_resolve_action,
+        input.policy.routing_mode,
+    );
 
     // Handle `FINAL,REJECT` cleanly via catch-all reject rule (M-4)
     if final_is_reject {
@@ -735,9 +795,20 @@ fn build_route_section(
 
     let coalesced_count = route_rules.len();
 
+    // Under BlockToPreventLeak, set prefer_ipv4 on default_domain_resolver so dialing a pure-IPv6
+    // proxy node hostname succeeds while user traffic remains strictly IPv4-only.
+    let default_domain_resolver = if input.policy.ipv6_mode == Ipv6Policy::BlockToPreventLeak {
+        json!({
+            "server": "dns-direct",
+            "strategy": "prefer_ipv4"
+        })
+    } else {
+        json!("dns-direct")
+    };
+
     let route_obj = json!({
         "auto_detect_interface": true,
-        "default_domain_resolver": "dns-direct",
+        "default_domain_resolver": default_domain_resolver,
         "rules": route_rules,
         "final": final_outbound
     });
@@ -811,6 +882,31 @@ fn is_strictly_private_cidr(cidr: &str) -> bool {
     }
 }
 
+fn strip_host_brackets(raw: &str) -> &str {
+    raw.trim().trim_start_matches('[').trim_end_matches(']').trim()
+}
+
+fn normalize_vmess_security(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "" => "auto".to_string(),
+        "chacha20-ietf-poly1305" => "chacha20-poly1305".to_string(),
+        _ => lower,
+    }
+}
+
+fn normalize_duration_seconds(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("{s}s"))
+    } else {
+        Some(s.to_string())
+    }
+}
+
 fn is_mandatory_tls(protocol: &ProtocolConfig) -> bool {
     matches!(
         protocol,
@@ -827,7 +923,7 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             node_name: node.name.clone(),
         });
     }
-    let dial_server = node.effective_dial_server().trim();
+    let dial_server = strip_host_brackets(node.effective_dial_server());
     if dial_server.is_empty()
         || dial_server
             .chars()
@@ -877,7 +973,7 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             obj.insert("type".into(), json!("vmess"));
             obj.insert("uuid".into(), json!(uuid));
             obj.insert("alter_id".into(), json!(alter_id));
-            obj.insert("security".into(), json!(security));
+            obj.insert("security".into(), json!(normalize_vmess_security(security)));
         }
         ProtocolConfig::AnyTls {
             password,
@@ -887,10 +983,16 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
         } => {
             obj.insert("type".into(), json!("anytls"));
             obj.insert("password".into(), json!(password));
-            if let Some(v) = idle_session_check_interval {
+            if let Some(v) = idle_session_check_interval
+                .as_deref()
+                .and_then(normalize_duration_seconds)
+            {
                 obj.insert("idle_session_check_interval".into(), json!(v));
             }
-            if let Some(v) = idle_session_timeout {
+            if let Some(v) = idle_session_timeout
+                .as_deref()
+                .and_then(normalize_duration_seconds)
+            {
                 obj.insert("idle_session_timeout".into(), json!(v));
             }
             if let Some(v) = min_idle_session {
@@ -910,7 +1012,7 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             if !server_ports.is_empty() {
                 obj.insert("server_ports".into(), json!(server_ports));
             }
-            if let Some(hi) = hop_interval {
+            if let Some(hi) = hop_interval.as_deref().and_then(normalize_duration_seconds) {
                 obj.insert("hop_interval".into(), json!(hi));
             }
             if let Some(up) = up_mbps {
@@ -942,16 +1044,24 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             if let Some(pw) = password {
                 obj.insert("password".into(), json!(pw));
             }
-            if let Some(cc) = congestion_control {
+            if let Some(cc) = congestion_control
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+            {
                 obj.insert("congestion_control".into(), json!(cc));
             }
-            if let Some(mode) = udp_relay_mode {
+            if let Some(mode) = udp_relay_mode
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+            {
                 obj.insert("udp_relay_mode".into(), json!(mode));
             }
             if *zero_rtt_handshake {
                 obj.insert("zero_rtt_handshake".into(), json!(true));
             }
-            if let Some(hb) = heartbeat {
+            if let Some(hb) = heartbeat.as_deref().and_then(normalize_duration_seconds) {
                 obj.insert("heartbeat".into(), json!(hb));
             }
         }
@@ -966,8 +1076,9 @@ fn compile_node_outbound(node: &NodeConfig, tag: &str) -> Result<Value, CompileE
             obj.insert("password".into(), json!(password));
             // Allowlist sing-box supported built-in Shadowsocks plugins only (L-3)
             if let Some(p) = plugin {
-                if matches!(p.as_str(), "obfs-local" | "v2ray-plugin") {
-                    obj.insert("plugin".into(), json!(p));
+                let p_trimmed = p.trim();
+                if matches!(p_trimmed, "obfs-local" | "v2ray-plugin") {
+                    obj.insert("plugin".into(), json!(p_trimmed));
                     if let Some(opts) = plugin_opts {
                         obj.insert("plugin_opts".into(), json!(opts));
                     }
@@ -1002,8 +1113,11 @@ fn compile_tls(node: &NodeConfig, tls: &TlsConfig) -> Result<Option<Value>, Comp
         obj.insert("disable_sni".into(), json!(true));
     }
     if let Some(sni) = &tls.server_name {
-        if !sni.is_empty() {
-            obj.insert("server_name".into(), json!(sni));
+        let clean_sni = strip_host_brackets(sni);
+        // RFC 6066 forbids IP literals in TLS SNI; omit server_name when it is an IP address
+        // (sing-box still verifies IP SAN / SPKI pin against outbound `server`).
+        if !clean_sni.is_empty() && clean_sni.parse::<IpAddr>().is_err() {
+            obj.insert("server_name".into(), json!(clean_sni));
         }
     }
     if !tls.alpn.is_empty() {
@@ -1059,20 +1173,24 @@ fn compile_tls(node: &NodeConfig, tls: &TlsConfig) -> Result<Option<Value>, Comp
         }
     }
 
-    if let Some(fp) = &tls.utls_fingerprint {
-        if !fp.is_empty() {
-            obj.insert(
-                "utls".into(),
-                json!({
-                    "enabled": true,
-                    "fingerprint": fp
-                }),
-            );
+    // Never emit uTLS on QUIC protocols (Hysteria2, TUIC) — sing-box QUIC TLS rejects uTLS (P0-6).
+    if !node.is_quic_protocol() {
+        if let Some(fp) = &tls.utls_fingerprint {
+            let fp_norm = fp.trim().to_ascii_lowercase();
+            if !fp_norm.is_empty() {
+                obj.insert(
+                    "utls".into(),
+                    json!({
+                        "enabled": true,
+                        "fingerprint": fp_norm
+                    }),
+                );
+            }
         }
     }
 
     if let Some(reality) = &tls.reality {
-        if !obj.contains_key("utls") {
+        if !node.is_quic_protocol() && !obj.contains_key("utls") {
             obj.insert(
                 "utls".into(),
                 json!({

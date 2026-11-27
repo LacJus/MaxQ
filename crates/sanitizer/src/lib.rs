@@ -17,15 +17,46 @@ pub fn sanitize_import(raw: RawImportBundle) -> SanitizedImport {
     let mut nodes = raw.nodes;
     let mut general = raw.general;
 
-    // 1. Enforce Scheme A (Strict Default Safe), strip untrusted pre-populated pins/overrides,
-    //    and enforce mandatory TLS on Trojan / AnyTLS / Hysteria2 / TUIC.
+    // 1. Enforce Scheme A (Strict Default Safe), normalize cross-dialect fields, strip untrusted
+    //    pre-populated pins/overrides & disallowed Shadowsocks plugins, and enforce mandatory TLS.
     let mut insecure_names = Vec::new();
     let mut pending_pin_names = Vec::new();
     let mut stripped_pin_count = 0usize;
     let mut forced_tls_count = 0usize;
+    let mut stripped_ss_plugin_count = 0usize;
+    let mut stripped_ss_plugin_samples = Vec::new();
     let mut proxy_server_hosts: HashSet<String> = HashSet::new();
 
     for node in &mut nodes {
+        // Defense-in-depth canonical normalization (IPv6 brackets, cipher/protocol casing, durations)
+        normalize_node_fields(node);
+
+        // Strip disallowed Shadowsocks plugins so arbitrary external executables can never pass through
+        if let ProtocolConfig::Shadowsocks {
+            plugin,
+            plugin_opts,
+            ..
+        } = &mut node.protocol
+        {
+            if let Some(p) = plugin.as_deref() {
+                let p_trimmed = p.trim();
+                if matches!(p_trimmed, "obfs-local" | "v2ray-plugin") {
+                    *plugin = Some(p_trimmed.to_string());
+                } else {
+                    stripped_ss_plugin_count += 1;
+                    if stripped_ss_plugin_samples.len() < 5 {
+                        stripped_ss_plugin_samples.push(format!(
+                            "{}: {}",
+                            node.name,
+                            p_trimmed.chars().take(64).collect::<String>()
+                        ));
+                    }
+                    *plugin = None;
+                    *plugin_opts = None;
+                }
+            }
+        }
+
         // Strip untrusted pre-populated dial overrides and trust records (H-6)
         node.dial_override_server = None;
         if node.tls.trust_record.is_some() {
@@ -84,6 +115,20 @@ pub fn sanitize_import(raw: RawImportBundle) -> SanitizedImport {
         }
     }
     report.total_nodes_imported = nodes.len();
+
+    if stripped_ss_plugin_count > 0 {
+        report.findings.push(SecurityFinding {
+            severity: SecuritySeverity::High,
+            action: SecurityActionTaken::Stripped,
+            category: "stripped_unsafe_ss_plugin".to_string(),
+            summary: format!(
+                "Stripped {} disallowed Shadowsocks plugin(s) (only built-in obfs-local and v2ray-plugin are permitted) to prevent arbitrary executable invocation.",
+                stripped_ss_plugin_count
+            ),
+            samples: stripped_ss_plugin_samples,
+            count: stripped_ss_plugin_count,
+        });
+    }
 
     if stripped_pin_count > 0 {
         report.findings.push(SecurityFinding {
@@ -661,6 +706,80 @@ fn redact_url_for_report(raw: &str) -> String {
     }
 }
 
+fn strip_ipv6_brackets(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_string()
+}
+
+fn normalize_duration_seconds(raw: Option<String>) -> Option<String> {
+    let s = raw?.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("{s}s"))
+    } else {
+        Some(s)
+    }
+}
+
+fn normalize_lowercase_opt(raw: Option<String>) -> Option<String> {
+    let s = raw?.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn normalize_node_fields(node: &mut NodeConfig) {
+    node.server = strip_ipv6_brackets(&node.server);
+    node.tls.server_name = node
+        .tls
+        .server_name
+        .take()
+        .map(|s| strip_ipv6_brackets(&s))
+        .filter(|s| !s.is_empty());
+    node.tls.utls_fingerprint = normalize_lowercase_opt(node.tls.utls_fingerprint.take());
+
+    match &mut node.protocol {
+        ProtocolConfig::Vmess { security, .. } => {
+            let lower = security.trim().to_ascii_lowercase();
+            *security = match lower.as_str() {
+                "" => "auto".to_string(),
+                "chacha20-ietf-poly1305" => "chacha20-poly1305".to_string(),
+                _ => lower,
+            };
+        }
+        ProtocolConfig::Tuic {
+            congestion_control,
+            udp_relay_mode,
+            heartbeat,
+            ..
+        } => {
+            *congestion_control = normalize_lowercase_opt(congestion_control.take());
+            *udp_relay_mode = normalize_lowercase_opt(udp_relay_mode.take());
+            *heartbeat = normalize_duration_seconds(heartbeat.take());
+        }
+        ProtocolConfig::Hysteria2 { hop_interval, .. } => {
+            *hop_interval = normalize_duration_seconds(hop_interval.take());
+        }
+        ProtocolConfig::AnyTls {
+            idle_session_check_interval,
+            idle_session_timeout,
+            ..
+        } => {
+            *idle_session_check_interval =
+                normalize_duration_seconds(idle_session_check_interval.take());
+            *idle_session_timeout = normalize_duration_seconds(idle_session_timeout.take());
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +944,103 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.category == "stripped_unsafe_skip_proxy" && f.count == 4));
+    }
+
+    #[test]
+    fn strips_disallowed_shadowsocks_plugins_and_normalizes_node_fields() {
+        let evil_ss = NodeConfig::new(
+            "Evil-SS",
+            "[2001:db8::9]",
+            8388,
+            ProtocolConfig::Shadowsocks {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                plugin: Some("/bin/sh".into()),
+                plugin_opts: Some("-c whoami".into()),
+            },
+        );
+        let safe_ss = NodeConfig::new(
+            "Safe-SS",
+            "ss.example.com",
+            8388,
+            ProtocolConfig::Shadowsocks {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                plugin: Some("obfs-local".into()),
+                plugin_opts: Some("obfs=http;obfs-host=bing.com".into()),
+            },
+        );
+        let mut vmess = NodeConfig::new(
+            "VMess-IETF",
+            "vmess.example.com",
+            443,
+            ProtocolConfig::Vmess {
+                uuid: "11111111-1111-4111-8111-111111111111".into(),
+                alter_id: 0,
+                security: "ChaCha20-IETF-Poly1305".into(),
+            },
+        );
+        vmess.tls.server_name = Some("[2001:db8::10]".into());
+        vmess.tls.utls_fingerprint = Some(" Chrome ".into());
+
+        let mut tuic = NodeConfig::new(
+            "TUIC-Upper",
+            "tuic.example.com",
+            443,
+            ProtocolConfig::Tuic {
+                uuid: "22222222-2222-4222-8222-222222222222".into(),
+                password: Some("pw".into()),
+                congestion_control: Some("BBR".into()),
+                udp_relay_mode: Some("Native".into()),
+                zero_rtt_handshake: false,
+                heartbeat: Some("10".into()),
+            },
+        );
+        tuic.tls.enabled = true;
+
+        let raw = RawImportBundle {
+            format_detected: ImportFormat::ShareLinks,
+            nodes: vec![evil_ss, safe_ss, vmess, tuic],
+            ..Default::default()
+        };
+
+        let sanitized = sanitize_import(raw);
+        assert!(sanitized
+            .report
+            .findings
+            .iter()
+            .any(|f| f.category == "stripped_unsafe_ss_plugin" && f.count == 1));
+        assert!(matches!(
+            &sanitized.nodes[0].protocol,
+            ProtocolConfig::Shadowsocks {
+                plugin: None,
+                plugin_opts: None,
+                ..
+            }
+        ));
+        assert_eq!(sanitized.nodes[0].server, "2001:db8::9");
+        assert!(matches!(
+            &sanitized.nodes[1].protocol,
+            ProtocolConfig::Shadowsocks {
+                plugin: Some(p),
+                plugin_opts: Some(_),
+                ..
+            } if p == "obfs-local"
+        ));
+        assert!(matches!(
+            &sanitized.nodes[2].protocol,
+            ProtocolConfig::Vmess { security, .. } if security == "chacha20-poly1305"
+        ));
+        assert_eq!(sanitized.nodes[2].tls.server_name.as_deref(), Some("2001:db8::10"));
+        assert_eq!(sanitized.nodes[2].tls.utls_fingerprint.as_deref(), Some("chrome"));
+        assert!(matches!(
+            &sanitized.nodes[3].protocol,
+            ProtocolConfig::Tuic {
+                congestion_control: Some(cc),
+                udp_relay_mode: Some(mode),
+                heartbeat: Some(hb),
+                ..
+            } if cc == "bbr" && mode == "native" && hb == "10s"
+        ));
     }
 }
