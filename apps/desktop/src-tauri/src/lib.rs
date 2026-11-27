@@ -158,8 +158,8 @@ fn get_builtin_rules_info() -> BuiltinRulesInfo {
 }
 
 #[tauri::command]
-async fn get_tun_service_status(state: State<'_, AppState>) -> TunServiceStatus {
-    query_tun_status_coalesced(&state, false).await
+async fn get_tun_service_status(state: State<'_, AppState>) -> Result<TunServiceStatus, String> {
+    Ok(query_tun_status_coalesced(&state, false).await)
 }
 
 #[tauri::command]
