@@ -151,7 +151,7 @@ function tlsBadge(node: NodeConfig) {
 
 const DEFAULT_ABOUT: AboutInfo = {
   app_name: "MaxQ",
-  app_version: "0.3.1",
+  app_version: "1.0.0",
   engine_brand: "JaxCore · sing-box",
   core_version: "1.14.4",
   creator: "JucStudio · Neon",
