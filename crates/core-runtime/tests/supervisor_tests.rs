@@ -23,7 +23,16 @@ async fn starts_real_singbox_enforces_clash_api_bearer_auth_and_stops_cleanly() 
                 .map(|h| PathBuf::from(h).join(".local/bin/sing-box"))
                 .filter(|p| p.exists())
         })
-        .unwrap_or_else(|| PathBuf::from("/home/antigravity/.local/bin/sing-box"));
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(if cfg!(windows) { "sing-box.exe" } else { "sing-box" }))
+                    .find(|p| p.exists())
+            })
+        })
+        .expect(
+            "sing-box v1.14.4 test binary not found; set SING_BOX_BIN or install sing-box in PATH / ~/.local/bin",
+        );
     assert!(bin.exists(), "sing-box test binary must exist");
 
     let mut node = NodeConfig::new(

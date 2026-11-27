@@ -23,16 +23,25 @@ fn find_singbox_binary() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    let fallback = PathBuf::from("/home/antigravity/.local/bin/sing-box");
-    if fallback.exists() {
-        return Some(fallback);
+    if let Some(paths) = std::env::var_os("PATH") {
+        let bin_name = if cfg!(windows) {
+            "sing-box.exe"
+        } else {
+            "sing-box"
+        };
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(bin_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
     }
     None
 }
 
 fn verify_with_real_singbox(json_value: &serde_json::Value, case_name: &str) {
     let Some(bin) = find_singbox_binary() else {
-        panic!("sing-box v1.14.4 test validator binary not found at /home/antigravity/.local/bin/sing-box");
+        panic!("sing-box v1.14.4 test validator binary not found; set SING_BOX_BIN or install sing-box in PATH / ~/.local/bin");
     };
     let tmp_path = std::env::temp_dir().join(format!("maxq_sb_check_{case_name}.json"));
     let content = serde_json::to_string_pretty(json_value).unwrap();
