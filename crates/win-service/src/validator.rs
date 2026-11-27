@@ -40,8 +40,8 @@ const FORBIDDEN_KEY_SUBSTRINGS: &[&str] = &[
     "output",
 ];
 
-/// Streams a binary file and verifies its SHA-256 matches `expected_hex` (case-insensitive).
-pub fn verify_binary_sha256(path: &Path, expected_hex: &str) -> Result<String, String> {
+/// Streams a file and returns its lowercase hexadecimal SHA-256 digest.
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path)
         .map_err(|e| format!("failed to open '{}' for SHA-256 check: {e}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -55,7 +55,12 @@ pub fn verify_binary_sha256(path: &Path, expected_hex: &str) -> Result<String, S
         }
         hasher.update(&buf[..n]);
     }
-    let actual = hex::encode(hasher.finalize());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Streams a binary file and verifies its SHA-256 matches `expected_hex` (case-insensitive).
+pub fn verify_binary_sha256(path: &Path, expected_hex: &str) -> Result<String, String> {
+    let actual = compute_file_sha256(path)?;
     if !actual.eq_ignore_ascii_case(expected_hex.trim()) {
         return Err(format!(
             "sing-box.exe SHA-256 integrity mismatch! expected={}, actual={}",
@@ -242,13 +247,41 @@ pub fn is_authorized_caller_image(service_exe: &Path, caller_exe: &Path) -> bool
     false
 }
 
+const FORBIDDEN_TUN_FIELDS: &[&str] = &[
+    "route_address",
+    "route_address_set",
+    "route_exclude_address_set",
+    "platform",
+    "inet4_route_address",
+    "inet6_route_address",
+    "inet4_route_exclude_address",
+    "inet6_route_exclude_address",
+    "include_interface",
+    "exclude_interface",
+    "include_uid",
+    "exclude_uid",
+    "include_package",
+    "exclude_package",
+];
+
+const ALLOWED_SHADOWSOCKS_PLUGINS: &[&str] = &["obfs-local", "v2ray-plugin"];
+
+fn strip_win_verbatim_prefix(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        format!(r"\\{}", &trimmed[8..])
+    } else if let Some(stripped) = trimmed.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn split_win_parent_and_name(raw: &str) -> (String, String) {
-    let normalized = raw
-        .trim()
-        .trim_start_matches(r"\\?\")
+    let normalized = strip_win_verbatim_prefix(raw)
         .replace('/', "\\")
         .trim_end_matches('\\')
-        .to_ascii_lowercase();
+        .to_lowercase();
     match normalized.rsplit_once('\\') {
         Some((parent, name)) => (parent.to_string(), name.to_string()),
         None => (String::new(), normalized),
@@ -310,8 +343,16 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
                 .get("external_controller")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !ctrl.starts_with("127.0.0.1:") {
+            let Some(port_str) = ctrl.strip_prefix("127.0.0.1:") else {
                 return Err("clash_api.external_controller must bind strictly to 127.0.0.1".into());
+            };
+            let port = port_str.parse::<u16>().map_err(|_| {
+                "clash_api.external_controller must specify a valid port on 127.0.0.1".to_string()
+            })?;
+            if port < 1024 {
+                return Err(format!(
+                    "clash_api.external_controller port {port} must be >= 1024"
+                ));
             }
             let secret = api_obj.get("secret").and_then(|v| v.as_str()).unwrap_or("");
             if secret.len() < 32 || secret.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -334,7 +375,7 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
         }
     }
 
-    // 4. Validate outbounds strictly against allowed protocol types
+    // 4. Validate outbounds strictly against allowed protocol types, plugin allowlist, and inline cert/key bans
     let outbounds = root_obj
         .get("outbounds")
         .and_then(|v| v.as_array())
@@ -347,6 +388,19 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
         if !ALLOWED_OUTBOUND_TYPES.contains(&ob_type) {
             return Err(format!("outbound type '{ob_type}' is not allowed in TUN service"));
         }
+        if ob_type == "shadowsocks" {
+            if let Some(plugin_val) = ob.get("plugin").filter(|v| !v.is_null()) {
+                let plugin = plugin_val.as_str().ok_or_else(|| {
+                    format!("outbounds[{idx}].plugin must be a string")
+                })?;
+                if !ALLOWED_SHADOWSOCKS_PLUGINS.contains(&plugin) {
+                    return Err(format!(
+                        "shadowsocks plugin '{plugin}' is not allowed in TUN service"
+                    ));
+                }
+            }
+        }
+        audit_outbound_inline_secrets(ob, false)?;
     }
 
     // 5. Forbid external route.rule_set inside SYSTEM service
@@ -356,7 +410,7 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
         }
     }
 
-    // 6. Validate inbounds strictly: ONLY `tun` (private CIDRs only, no route_address/platform) and optional loopback `mixed`
+    // 6. Validate inbounds strictly: ONLY `tun` (private/RFC-2544 CIDRs only, no routing/interface/uid/package overrides) and optional loopback `mixed`
     let inbounds = root_obj
         .get("inbounds")
         .and_then(|v| v.as_array())
@@ -370,12 +424,17 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
         match ib_type {
             "tun" => {
                 has_tun = true;
-                if ib.get("route_address").is_some()
-                    || ib.get("route_address_set").is_some()
-                    || ib.get("route_exclude_address_set").is_some()
-                    || ib.get("platform").is_some()
-                {
-                    return Err("forbidden tun routing override field detected".into());
+                for &forbidden in FORBIDDEN_TUN_FIELDS {
+                    if ib.get(forbidden).is_some() {
+                        return Err(format!(
+                            "forbidden tun field '{forbidden}' detected"
+                        ));
+                    }
+                }
+                for addr_field in ["address", "inet4_address", "inet6_address"] {
+                    if let Some(addr_val) = ib.get(addr_field) {
+                        validate_tun_address_field(addr_field, addr_val)?;
+                    }
                 }
                 if let Some(excluded) = ib.get("route_exclude_address").and_then(|v| v.as_array()) {
                     for item in excluded {
@@ -395,6 +454,16 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
                 if listen != "127.0.0.1" {
                     return Err("mixed inbound in TUN service must bind strictly to 127.0.0.1".into());
                 }
+                if let Some(port_val) = ib.get("listen_port") {
+                    let port = port_val.as_u64().ok_or_else(|| {
+                        "mixed inbound listen_port must be an integer".to_string()
+                    })?;
+                    if !(1024..=65535).contains(&port) {
+                        return Err(format!(
+                            "mixed inbound listen_port {port} must be in 1024..=65535"
+                        ));
+                    }
+                }
             }
             other => {
                 return Err(format!("inbound type '{other}' is not allowed in TUN service"));
@@ -406,6 +475,61 @@ pub fn validate_service_config(config_json: &str) -> Result<Value, String> {
     }
 
     Ok(root)
+}
+
+/// Rejects inline `"certificate"` and `"key"` keys inside `outbounds` while continuing to allow
+/// `"certificate_public_key_sha256"` and Reality `"public_key"`.
+fn audit_outbound_inline_secrets(val: &Value, inside_freeform_map: bool) -> Result<(), String> {
+    match val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if !inside_freeform_map && (k == "certificate" || k == "key") {
+                    return Err(format!(
+                        "inline '{k}' key is forbidden inside outbounds in TUN service"
+                    ));
+                }
+                let child_freeform = inside_freeform_map || k == "headers";
+                audit_outbound_inline_secrets(v, child_freeform)?;
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                audit_outbound_inline_secrets(item, inside_freeform_map)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_tun_address_field(field: &str, val: &Value) -> Result<(), String> {
+    match val {
+        Value::String(cidr) => {
+            if !is_allowed_tun_address_cidr(cidr) {
+                return Err(format!(
+                    "non-private CIDR '{cidr}' forbidden in tun.{field}"
+                ));
+            }
+            Ok(())
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                return Err(format!("tun.{field} array must not be empty"));
+            }
+            for item in arr {
+                let cidr = item
+                    .as_str()
+                    .ok_or_else(|| format!("non-string entry in tun.{field}"))?;
+                if !is_allowed_tun_address_cidr(cidr) {
+                    return Err(format!(
+                        "non-private CIDR '{cidr}' forbidden in tun.{field}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!("tun.{field} must be a CIDR string or array of CIDR strings")),
+    }
 }
 
 /// Recursively audits every JSON object key in the configuration:
@@ -464,6 +588,40 @@ fn audit_json_keys_recursively(
     Ok(())
 }
 
+/// Validates allowed `tun.address` CIDRs strictly within RFC-1918 / RFC-6598 / RFC-2544 / RFC-4193:
+/// `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `198.18.0.0/15`, `fc00::/7`.
+fn is_allowed_tun_address_cidr(cidr: &str) -> bool {
+    let Some((ip_part, prefix_part)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = ip_part.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_part.parse::<u8>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            if prefix > 32 {
+                return false;
+            }
+            let o = v4.octets();
+            (o[0] == 10 && prefix >= 8)
+                || (o[0] == 172 && (16..=31).contains(&o[1]) && prefix >= 12)
+                || (o[0] == 192 && o[1] == 168 && prefix >= 16)
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 64 && prefix >= 10)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19) && prefix >= 15)
+        }
+        IpAddr::V6(v6) => {
+            if prefix > 128 {
+                return false;
+            }
+            let s = v6.segments();
+            (s[0] & 0xfe00) == 0xfc00 && prefix >= 7
+        }
+    }
+}
+
 fn is_strictly_private_cidr(cidr: &str) -> bool {
     let Some((ip_part, prefix_part)) = cidr.trim().split_once('/') else {
         return false;
@@ -517,6 +675,11 @@ mod tests {
             svc,
             Path::new(r"\\?\C:\Program Files\MaxQ\MaxQ.exe")
         ));
+        // UNC verbatim path mapping (`\\?\UNC\server\share` -> `\\server\share`) & Unicode case folding
+        assert!(is_authorized_caller_image(
+            Path::new(r"\\filesrv\ÜBER\MaxQ\resources\maxq-service.exe"),
+            Path::new(r"\\?\UNC\filesrv\über\MaxQ\MaxQ.exe")
+        ));
         assert!(!is_authorized_caller_image(
             svc,
             Path::new(r"C:\Users\alice\AppData\Local\Temp\maxq-desktop.exe")
@@ -536,7 +699,19 @@ mod tests {
                 { "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"], "route_exclude_address": ["192.168.0.0/16"] }
             ],
             "outbounds": [
-                { "type": "trojan", "tag": "proxy", "server": "edge.example.com", "server_port": 443, "password": "pw", "transport": { "type": "ws", "path": "/ws", "headers": { "Host": "cdn.example.com" } } },
+                {
+                    "type": "trojan",
+                    "tag": "proxy",
+                    "server": "edge.example.com",
+                    "server_port": 443,
+                    "password": "pw",
+                    "tls": {
+                        "enabled": true,
+                        "certificate_public_key_sha256": ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],
+                        "reality": { "enabled": true, "public_key": "pubKeyTest", "short_id": "abcd" }
+                    },
+                    "transport": { "type": "ws", "path": "/ws", "headers": { "Host": "cdn.example.com" } }
+                },
                 { "type": "direct", "tag": "direct" }
             ],
             "experimental": {
@@ -549,6 +724,15 @@ mod tests {
             }
         });
         assert!(validate_service_config(&valid_ws.to_string()).is_ok());
+
+        // Allowed RFC-2544 + ULA IPv6 + CGNAT TUN addresses MUST pass
+        let mut allowed_tun_addrs = valid_ws.clone();
+        allowed_tun_addrs["inbounds"][1]["address"] = json!([
+            "198.18.0.1/30",
+            "fdfe:dcba:9876::1/126",
+            "100.64.0.0/10"
+        ]);
+        assert!(validate_service_config(&allowed_tun_addrs.to_string()).is_ok());
 
         // C-1: Case-insensitive Go EqualFold bypass MUST be rejected
         let mut evil_case = valid_ws.clone();
@@ -570,15 +754,73 @@ mod tests {
             json!(["https://attacker.example"]);
         assert!(validate_service_config(&evil_cors.to_string()).is_err());
 
-        // C-2: Public CIDR bypass rejected
+        // C-2: Public CIDR bypass in route_exclude_address and tun.address rejected
         let mut evil_tun = valid_ws.clone();
         evil_tun["inbounds"][1]["route_exclude_address"] = json!(["0.0.0.0/0"]);
         assert!(validate_service_config(&evil_tun.to_string()).is_err());
+
+        for bad_addr in ["8.8.8.8/32", "1.1.1.1/24", "198.20.0.1/30", "2001:db8::1/64", "10.0.0.0/7"] {
+            let mut bad_tun_addr = valid_ws.clone();
+            bad_tun_addr["inbounds"][1]["address"] = json!([bad_addr]);
+            assert!(
+                validate_service_config(&bad_tun_addr.to_string()).is_err(),
+                "expected tun.address '{bad_addr}' to be rejected"
+            );
+        }
+
+        // All forbidden tun override fields rejected
+        for &field in FORBIDDEN_TUN_FIELDS {
+            let mut bad_tun_field = valid_ws.clone();
+            bad_tun_field["inbounds"][1][field] = json!(["10.0.0.0/8"]);
+            assert!(
+                validate_service_config(&bad_tun_field.to_string()).is_err(),
+                "expected tun.{field} to be rejected"
+            );
+        }
 
         // C-2: Disallowed outbound type (`tor` / `ssh`) rejected
         let mut evil_ob = valid_ws.clone();
         evil_ob["outbounds"] = json!([{ "type": "tor", "tag": "p" }]);
         assert!(validate_service_config(&evil_ob.to_string()).is_err());
+
+        // Shadowsocks plugin allowlist (`obfs-local` / `v2ray-plugin` allowed; arbitrary binaries rejected)
+        for allowed_plugin in ["obfs-local", "v2ray-plugin"] {
+            let mut ok_ss = valid_ws.clone();
+            ok_ss["outbounds"] = json!([
+                { "type": "shadowsocks", "tag": "ss", "server": "1.2.3.4", "server_port": 8388, "method": "aes-256-gcm", "password": "pw", "plugin": allowed_plugin },
+                { "type": "direct", "tag": "direct" }
+            ]);
+            assert!(validate_service_config(&ok_ss.to_string()).is_ok());
+        }
+        for bad_plugin in [r"C:\Windows\System32\cmd.exe", "../evil", "custom-plugin", ""] {
+            let mut bad_ss = valid_ws.clone();
+            bad_ss["outbounds"] = json!([
+                { "type": "shadowsocks", "tag": "ss", "server": "1.2.3.4", "server_port": 8388, "method": "aes-256-gcm", "password": "pw", "plugin": bad_plugin },
+                { "type": "direct", "tag": "direct" }
+            ]);
+            assert!(
+                validate_service_config(&bad_ss.to_string()).is_err(),
+                "expected shadowsocks plugin '{bad_plugin}' to be rejected"
+            );
+        }
+
+        // Inline `certificate` and `key` inside outbounds rejected
+        let mut evil_inline_cert = valid_ws.clone();
+        evil_inline_cert["outbounds"][0]["tls"]["certificate"] = json!("-----BEGIN CERTIFICATE-----");
+        assert!(validate_service_config(&evil_inline_cert.to_string()).is_err());
+
+        let mut evil_inline_key = valid_ws.clone();
+        evil_inline_key["outbounds"][0]["tls"]["key"] = json!("-----BEGIN PRIVATE KEY-----");
+        assert!(validate_service_config(&evil_inline_key.to_string()).is_err());
+
+        // Privileged ports (< 1024) rejected for mixed.listen_port and clash_api.external_controller
+        let mut evil_mixed_port = valid_ws.clone();
+        evil_mixed_port["inbounds"][0]["listen_port"] = json!(80);
+        assert!(validate_service_config(&evil_mixed_port.to_string()).is_err());
+
+        let mut evil_clash_port = valid_ws.clone();
+        evil_clash_port["experimental"]["clash_api"]["external_controller"] = json!("127.0.0.1:443");
+        assert!(validate_service_config(&evil_clash_port.to_string()).is_err());
     }
 
     #[test]

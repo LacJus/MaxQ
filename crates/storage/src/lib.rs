@@ -52,6 +52,7 @@ pub struct VaultStore {
 impl VaultStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -304,6 +305,15 @@ impl VaultStore {
         Ok(node)
     }
 
+    /// Clears a node's SPKI pin and restores strict `SystemCa` TLS verification.
+    pub fn clear_node_pin(&mut self, node_id: &str) -> Result<NodeConfig, StorageError> {
+        let mut node = self.get_node(node_id)?;
+        node.tls.verify_mode = TlsVerifyMode::SystemCa;
+        node.tls.trust_record = None;
+        self.update_node(&node)?;
+        Ok(node)
+    }
+
     /// Updates the persisted `[Host]` approval state for a profile and updates affected nodes.
     pub fn update_profile_hosts(
         &mut self,
@@ -503,5 +513,65 @@ mod tests {
         // Cascade delete cleans up nodes & trust vault
         store.delete_profile(&profile_id).unwrap();
         assert!(store.get_trust_record(&node_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_node_pin_resets_verify_mode_and_deletes_trust_record() {
+        let mut store = VaultStore::open_in_memory().unwrap();
+        let mut node = NodeConfig::new(
+            "Trojan-SG",
+            "sg.example.com",
+            443,
+            ProtocolConfig::Trojan {
+                password: "secret".into(),
+            },
+        );
+        node.tls.enabled = true;
+        node.tls.verify_mode = TlsVerifyMode::PinnedSpki;
+        node.tls.trust_record = Some(TrustRecord {
+            spki_sha256_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into(),
+            cert_sha256_hex: "b".repeat(64),
+            cert_sha256_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into(),
+            sni: "sg.example.com".into(),
+            subject: "CN=sg.example.com".into(),
+            issuer: "CN=sg.example.com".into(),
+            san_dns: vec!["sg.example.com".into()],
+            san_ip: vec![],
+            not_before: "2026-01-01".into(),
+            not_after: "2027-01-01".into(),
+            is_self_signed: true,
+            first_seen_at: Utc::now(),
+            last_verified_at: Utc::now(),
+            origin: TrustOrigin::TofuProbe,
+        });
+        let node_id = node.id.clone();
+
+        let sanitized = SanitizedImport {
+            format: ImportFormat::ShareLinks,
+            nodes: vec![node],
+            rules: vec![],
+            general: GeneralSettings::default(),
+            hosts: vec![],
+            report: ImportSecurityReport::default(),
+            parse_warnings: vec![],
+        };
+        store.save_sanitized_import("Pin Clear Test", &sanitized).unwrap();
+        assert!(store.get_trust_record(&node_id).unwrap().is_some());
+
+        let cleared = store.clear_node_pin(&node_id).unwrap();
+        assert_eq!(cleared.tls.verify_mode, TlsVerifyMode::SystemCa);
+        assert!(cleared.tls.trust_record.is_none());
+
+        // Persisted state matches returned NodeConfig and trust_vault row is removed
+        let reloaded = store.get_node(&node_id).unwrap();
+        assert_eq!(reloaded.tls.verify_mode, TlsVerifyMode::SystemCa);
+        assert!(reloaded.tls.trust_record.is_none());
+        assert!(store.get_trust_record(&node_id).unwrap().is_none());
+
+        // Unknown node ID fails with NotFound
+        assert!(matches!(
+            store.clear_node_pin("nonexistent-node"),
+            Err(StorageError::NotFound(_))
+        ));
     }
 }

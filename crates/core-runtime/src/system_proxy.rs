@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::RuntimeError;
 
+const WININET_PROXY_TYPE_DIRECT: u32 = 0x1;
+const WININET_PROXY_TYPE_PROXY: u32 = 0x2;
+#[cfg(test)]
+const WININET_PROXY_TYPE_AUTO_PROXY_URL: u32 = 0x4;
+#[cfg(test)]
+const WININET_PROXY_TYPE_AUTO_DETECT: u32 = 0x8;
+
 /// Snapshot of the user's original Windows Internet Settings before MaxQ modifies them.
 /// Persisted to disk so even a sudden crash or power loss cleanly restores system proxy on next launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +19,8 @@ pub struct SystemProxyBackup {
     pub proxy_enable: u32,
     pub proxy_server: Option<String>,
     pub proxy_override: Option<String>,
+    #[serde(default)]
+    pub wininet_flags: Option<u32>,
 }
 
 impl SystemProxyBackup {
@@ -20,7 +29,29 @@ impl SystemProxyBackup {
             proxy_enable: 0,
             proxy_server: None,
             proxy_override: None,
+            wininet_flags: None,
         }
+    }
+}
+
+fn strip_nul(s: &str) -> String {
+    s.replace('\0', "")
+}
+
+#[cfg(any(windows, test))]
+fn compute_wininet_flags(
+    enable: bool,
+    existing_flags: Option<u32>,
+    restore_flags: Option<u32>,
+) -> u32 {
+    if enable {
+        restore_flags.unwrap_or(WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY)
+            | WININET_PROXY_TYPE_PROXY
+    } else {
+        let base = restore_flags
+            .or(existing_flags)
+            .unwrap_or(WININET_PROXY_TYPE_DIRECT);
+        (base & !WININET_PROXY_TYPE_PROXY) | WININET_PROXY_TYPE_DIRECT
     }
 }
 
@@ -87,23 +118,39 @@ pub fn is_loopback_proxy_server(server: Option<&str>) -> bool {
 
 /// Ensures MaxQ NEVER captures or restores an enabled loopback proxy (such as `127.0.0.1:17890`)
 /// or a broken `ProxyEnable=1` with an empty `ProxyServer`, preventing infinite stuck-proxy loops.
-/// Legitimate non-loopback proxies (e.g. corporate `10.0.0.5:8080`) are preserved faithfully.
-pub fn sanitize_backup(backup: SystemProxyBackup) -> SystemProxyBackup {
+/// Legitimate non-loopback proxies (e.g. corporate `10.0.0.5:8080`) and PAC/WPAD flags are preserved.
+pub fn sanitize_backup(mut backup: SystemProxyBackup) -> SystemProxyBackup {
+    backup.proxy_server = backup.proxy_server.map(|s| strip_nul(&s));
+    backup.proxy_override = backup.proxy_override.map(|s| strip_nul(&s));
+
     let has_server = backup
         .proxy_server
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
     let points_to_loopback = is_loopback_proxy_server(backup.proxy_server.as_deref());
+    let cleaned_disabled_flags = backup
+        .wininet_flags
+        .map(|f| (f & !WININET_PROXY_TYPE_PROXY) | WININET_PROXY_TYPE_DIRECT);
 
     if backup.proxy_enable != 0 {
         if !has_server || points_to_loopback {
-            return SystemProxyBackup::disabled();
+            return SystemProxyBackup {
+                proxy_enable: 0,
+                proxy_server: None,
+                proxy_override: None,
+                wininet_flags: cleaned_disabled_flags,
+            };
         }
         return backup;
     }
 
     if points_to_loopback {
-        return SystemProxyBackup::disabled();
+        return SystemProxyBackup {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+            wininet_flags: cleaned_disabled_flags,
+        };
     }
 
     backup
@@ -221,6 +268,29 @@ impl SystemProxyManager {
         Ok(false)
     }
 
+    fn write_backup_atomic(&self, backup: &SystemProxyBackup) -> Result<(), RuntimeError> {
+        use std::io::Write;
+        let payload = serde_json::to_string_pretty(backup)?;
+        let tmp_path = self.backup_path.with_extension("json.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(payload.as_bytes())?;
+            let _ = file.sync_all();
+        }
+        match std::fs::rename(&tmp_path, &self.backup_path) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // On Windows, `rename` fails if the destination already exists.
+                let _ = std::fs::remove_file(&self.backup_path);
+                if let Err(err) = std::fs::rename(&tmp_path, &self.backup_path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    std::fs::write(&self.backup_path, payload.as_bytes()).map_err(|_| err)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn enable_with<P: ProxyPlatform>(
         &mut self,
         backend: &P,
@@ -241,15 +311,12 @@ impl SystemProxyManager {
                 Some(existing) => {
                     let sanitized = sanitize_backup(existing.clone());
                     if sanitized != existing {
-                        std::fs::write(
-                            &self.backup_path,
-                            serde_json::to_string_pretty(&sanitized)?,
-                        )?;
+                        self.write_backup_atomic(&sanitized)?;
                     }
                 }
                 None => {
                     let safe = SystemProxyBackup::disabled();
-                    std::fs::write(&self.backup_path, serde_json::to_string_pretty(&safe)?)?;
+                    self.write_backup_atomic(&safe)?;
                 }
             }
         } else {
@@ -257,10 +324,7 @@ impl SystemProxyManager {
                 .read_current()
                 .unwrap_or_else(|_| SystemProxyBackup::disabled());
             let safe_backup = sanitize_backup(current);
-            std::fs::write(
-                &self.backup_path,
-                serde_json::to_string_pretty(&safe_backup)?,
-            )?;
+            self.write_backup_atomic(&safe_backup)?;
         }
 
         let bypass = build_windows_bypass_string(bypass_list);
@@ -366,6 +430,21 @@ pub fn build_windows_bypass_string(extra_bypass: &[String]) -> String {
         "127.*".into(),
         "10.*".into(),
         "172.16.*".into(),
+        "172.17.*".into(),
+        "172.18.*".into(),
+        "172.19.*".into(),
+        "172.20.*".into(),
+        "172.21.*".into(),
+        "172.22.*".into(),
+        "172.23.*".into(),
+        "172.24.*".into(),
+        "172.25.*".into(),
+        "172.26.*".into(),
+        "172.27.*".into(),
+        "172.28.*".into(),
+        "172.29.*".into(),
+        "172.30.*".into(),
+        "172.31.*".into(),
         "192.168.*".into(),
         "169.254.*".into(),
         "<local>".into(),
@@ -394,17 +473,17 @@ mod platform {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
 
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::Networking::WinInet::{
         InternetQueryOptionW, InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
         INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_PER_CONN_FLAGS,
         INTERNET_PER_CONN_OPTIONW, INTERNET_PER_CONN_OPTIONW_0, INTERNET_PER_CONN_OPTION_LISTW,
-        INTERNET_PER_CONN_PROXY_BYPASS, INTERNET_PER_CONN_PROXY_SERVER, PROXY_TYPE_DIRECT,
-        PROXY_TYPE_PROXY,
+        INTERNET_PER_CONN_PROXY_BYPASS, INTERNET_PER_CONN_PROXY_SERVER, PROXY_TYPE_PROXY,
     };
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_USERS, KEY_READ, KEY_WRITE};
+    use winreg::{RegKey, RegValue};
 
-    use super::SystemProxyBackup;
+    use super::{compute_wininet_flags, is_loopback_proxy_server, strip_nul, SystemProxyBackup};
     use crate::RuntimeError;
 
     const INTERNET_SETTINGS_PATH: &str =
@@ -413,7 +492,8 @@ mod platform {
         r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
 
     fn to_wide_null(s: &str) -> Vec<u16> {
-        OsStr::new(s)
+        let cleaned = strip_nul(s);
+        OsStr::new(&cleaned)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
@@ -456,6 +536,53 @@ mod platform {
         }
     }
 
+    fn query_wininet_proxy_server(conn_name: Option<&str>) -> Option<String> {
+        let mut conn_wide: Option<Vec<u16>> = conn_name.map(to_wide_null);
+        let mut opt = INTERNET_PER_CONN_OPTIONW {
+            dwOption: INTERNET_PER_CONN_PROXY_SERVER,
+            Value: INTERNET_PER_CONN_OPTIONW_0 {
+                pszValue: null_mut(),
+            },
+        };
+        let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+            dwSize: std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+            pszConnection: conn_wide.as_mut().map_or(null_mut(), |v| v.as_mut_ptr()),
+            dwOptionCount: 1,
+            dwOptionError: 0,
+            pOptions: &mut opt,
+        };
+        let mut list_size = std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32;
+        let ok = unsafe {
+            InternetQueryOptionW(
+                null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                &mut list as *mut _ as *mut c_void,
+                &mut list_size,
+            )
+        };
+        let _ = &conn_wide;
+        if ok == 0 {
+            return None;
+        }
+        let ptr = unsafe { opt.Value.pszValue };
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while len < 4096 && unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        let server = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) });
+        unsafe {
+            GlobalFree(ptr as *mut c_void);
+        }
+        if server.trim().is_empty() {
+            None
+        } else {
+            Some(server)
+        }
+    }
+
     /// Atomically updates Windows WinINet per-connection settings (including the authoritative
     /// `Connections\DefaultConnectionSettings` binary blob read by Edge/Chrome/Windows Settings).
     fn apply_wininet_per_conn(
@@ -463,13 +590,10 @@ mod platform {
         enable: bool,
         server: Option<&str>,
         bypass: Option<&str>,
+        restore_flags: Option<u32>,
     ) -> Result<(), String> {
-        let existing_flags = query_wininet_flags(conn_name).unwrap_or(PROXY_TYPE_DIRECT);
-        let flags = if enable {
-            PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY
-        } else {
-            (existing_flags & !PROXY_TYPE_PROXY) | PROXY_TYPE_DIRECT
-        };
+        let existing_flags = query_wininet_flags(conn_name);
+        let flags = compute_wininet_flags(enable, existing_flags, restore_flags);
 
         let mut conn_wide: Option<Vec<u16>> = conn_name.map(to_wide_null);
         let mut server_wide = to_wide_null(server.unwrap_or(""));
@@ -534,7 +658,8 @@ mod platform {
         let enable_dword: u32 = if enable { 1 } else { 0 };
         key.set_value("ProxyEnable", &enable_dword)
             .map_err(|e| RuntimeError::SystemProxy(e.to_string()))?;
-        match server.filter(|s| !s.trim().is_empty()) {
+        let clean_server = server.map(strip_nul);
+        match clean_server.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(s) => {
                 key.set_value("ProxyServer", &s)
                     .map_err(|e| RuntimeError::SystemProxy(e.to_string()))?;
@@ -543,7 +668,8 @@ mod platform {
                 let _ = key.delete_value("ProxyServer");
             }
         }
-        match bypass.filter(|o| !o.trim().is_empty()) {
+        let clean_bypass = bypass.map(strip_nul);
+        match clean_bypass.as_deref().filter(|o| !o.trim().is_empty()) {
             Some(o) => {
                 let _ = key.set_value("ProxyOverride", &o);
             }
@@ -560,11 +686,16 @@ mod platform {
             .open_subkey(INTERNET_SETTINGS_PATH)
             .map_err(|e| RuntimeError::SystemProxy(e.to_string()))?;
         let mut proxy_enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
-        let proxy_server: Option<String> = key.get_value("ProxyServer").ok();
+        let proxy_server: Option<String> = key
+            .get_value("ProxyServer")
+            .ok()
+            .or_else(|| query_wininet_proxy_server(None));
         let proxy_override: Option<String> = key.get_value("ProxyOverride").ok();
 
         // Also check WinINet `DefaultConnectionSettings` flags to detect Registry/WinINet desync
-        if let Some(flags) = query_wininet_flags(None) {
+        // and capture PAC (`PROXY_TYPE_AUTO_PROXY_URL`) / WPAD (`PROXY_TYPE_AUTO_DETECT`) flags.
+        let wininet_flags = query_wininet_flags(None);
+        if let Some(flags) = wininet_flags {
             if (flags & PROXY_TYPE_PROXY) != 0 {
                 proxy_enable = 1;
             }
@@ -574,11 +705,12 @@ mod platform {
             proxy_enable,
             proxy_server,
             proxy_override,
+            wininet_flags,
         })
     }
 
     pub fn set_proxy(server: &str, bypass: &str) -> Result<(), RuntimeError> {
-        let wininet_res = apply_wininet_per_conn(None, true, Some(server), Some(bypass));
+        let wininet_res = apply_wininet_per_conn(None, true, Some(server), Some(bypass), None);
         let reg_res = sync_registry_values(true, Some(server), Some(bypass));
         notify_wininet();
         match (wininet_res, reg_res) {
@@ -598,7 +730,8 @@ mod platform {
         let server = backup.proxy_server.as_deref();
         let bypass = backup.proxy_override.as_deref();
 
-        let wininet_res = apply_wininet_per_conn(None, enable, server, bypass);
+        let wininet_res =
+            apply_wininet_per_conn(None, enable, server, bypass, backup.wininet_flags);
         let reg_res = sync_registry_values(enable, server, bypass);
         notify_wininet();
         match (wininet_res, reg_res) {
@@ -610,9 +743,10 @@ mod platform {
     }
 
     pub fn force_disable_all() -> Result<(), RuntimeError> {
-        let wininet_res = apply_wininet_per_conn(None, false, None, None);
+        let wininet_res = apply_wininet_per_conn(None, false, None, None, None);
 
-        // Best-effort clear any dial-up / PPPoE / VPN connection profiles under `Connections`
+        // Best-effort clear dial-up / PPPoE / VPN connection profiles under `Connections`
+        // ONLY when their WinINet proxy server points to loopback — never wipe legitimate corporate VPN proxies.
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         if let Ok(conn_key) = hkcu.open_subkey(INTERNET_CONNECTIONS_PATH) {
             for item in conn_key.enum_values().flatten() {
@@ -622,7 +756,10 @@ mod platform {
                 {
                     continue;
                 }
-                let _ = apply_wininet_per_conn(Some(&name), false, None, None);
+                let conn_server = query_wininet_proxy_server(Some(&name));
+                if is_loopback_proxy_server(conn_server.as_deref()) {
+                    let _ = apply_wininet_per_conn(Some(&name), false, None, None, None);
+                }
             }
         }
 
@@ -634,6 +771,51 @@ mod platform {
             (Err(w), Ok(())) => Err(RuntimeError::SystemProxy(w)),
             (Ok(()), Err(r)) => Err(r),
         }
+    }
+
+    /// Best-effort sweep used by the elevated NSIS pre-uninstall hook (`--cleanup-sysproxy`):
+    /// clears loopback proxy entries across `HKCU` and all loaded user hives under `HKU\<SID>`
+    /// (never touching legitimate non-loopback corporate proxies).
+    pub fn cleanup_all_users_loopback() {
+        let _ = force_disable_all();
+
+        let hku = RegKey::predef(HKEY_USERS);
+        for sid in hku.enum_keys().flatten() {
+            if sid.eq_ignore_ascii_case(".DEFAULT")
+                || sid.to_ascii_lowercase().ends_with("_classes")
+            {
+                continue;
+            }
+            let settings_path = format!(r"{sid}\{INTERNET_SETTINGS_PATH}");
+            let Ok(key) = hku.open_subkey_with_flags(&settings_path, KEY_READ | KEY_WRITE) else {
+                continue;
+            };
+            let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+            let server: Option<String> = key.get_value("ProxyServer").ok();
+            if enabled != 0 && is_loopback_proxy_server(server.as_deref()) {
+                let _ = key.set_value("ProxyEnable", &0u32);
+                let _ = key.delete_value("ProxyServer");
+
+                // Also clear PROXY_TYPE_PROXY (0x02) bit in `Connections\DefaultConnectionSettings`
+                // while keeping PROXY_TYPE_DIRECT (0x01) + any PAC/WPAD flags intact.
+                let conn_path = format!(r"{sid}\{INTERNET_CONNECTIONS_PATH}");
+                if let Ok(conn_key) = hku.open_subkey_with_flags(&conn_path, KEY_READ | KEY_WRITE) {
+                    if let Ok(mut raw) = conn_key.get_raw_value("DefaultConnectionSettings") {
+                        if raw.bytes.len() >= 12 {
+                            raw.bytes[8] = (raw.bytes[8] & !0x02) | 0x01;
+                            let _ = conn_key.set_raw_value(
+                                "DefaultConnectionSettings",
+                                &RegValue {
+                                    bytes: raw.bytes,
+                                    vtype: raw.vtype,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        notify_wininet();
     }
 }
 
@@ -657,6 +839,14 @@ mod platform {
     pub fn force_disable_all() -> Result<(), RuntimeError> {
         Ok(())
     }
+
+    pub fn cleanup_all_users_loopback() {}
+}
+
+/// Headless uninstall helper: disables current-session WinINet proxy and sweeps any loaded
+/// `HKU\<SID>` hives whose `ProxyServer` points to a loopback address (P0-5).
+pub fn cleanup_all_users_loopback_proxies() {
+    platform::cleanup_all_users_loopback();
 }
 
 #[cfg(test)]
@@ -695,6 +885,7 @@ mod tests {
                 proxy_enable: 1,
                 proxy_server: Some(server.to_string()),
                 proxy_override: Some(bypass.to_string()),
+                wininet_flags: Some(WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY),
             };
             Ok(())
         }
@@ -755,6 +946,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("127.0.0.1:17890".into()),
             proxy_override: Some("localhost;127.*".into()),
+            wininet_flags: None,
         });
 
         let mut mgr = SystemProxyManager::new(&tmp_dir);
@@ -783,6 +975,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("127.0.0.1:17890".into()),
             proxy_override: Some("localhost;<local>".into()),
+            wininet_flags: None,
         };
         std::fs::write(
             tmp_dir.join("sysproxy-backup.json"),
@@ -806,6 +999,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("127.0.0.1:17890".into()),
             proxy_override: None,
+            wininet_flags: None,
         });
 
         let mut mgr = SystemProxyManager::new(&tmp_dir);
@@ -817,6 +1011,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("http=127.0.0.1:17890;https=127.0.0.1:17890".into()),
             proxy_override: None,
+            wininet_flags: None,
         };
         mgr.disable_and_restore_with(&mock).unwrap();
         assert_eq!(mock.current(), SystemProxyBackup::disabled());
@@ -834,6 +1029,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("127.0.0.1:17890".into()),
             proxy_override: None,
+            wininet_flags: None,
         });
 
         let mut mgr = SystemProxyManager::new(&tmp_dir);
@@ -851,6 +1047,11 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("10.0.0.5:8080".into()),
             proxy_override: Some("*.corp.internal;<local>".into()),
+            wininet_flags: Some(
+                WININET_PROXY_TYPE_DIRECT
+                    | WININET_PROXY_TYPE_PROXY
+                    | WININET_PROXY_TYPE_AUTO_PROXY_URL,
+            ),
         };
         let mock = MockProxyPlatform::new(corp.clone());
 
@@ -859,7 +1060,7 @@ mod tests {
         assert!(!mgr.recover_if_dirty_with(&mock).unwrap());
         assert_eq!(mock.current(), corp);
 
-        // Enable MaxQ -> sets 127.0.0.1:17890 -> disable -> faithfully restores corporate proxy
+        // Enable MaxQ -> sets 127.0.0.1:17890 -> disable -> faithfully restores corporate proxy + flags
         mgr.enable_with(&mock, 17890, &[]).unwrap();
         assert_eq!(
             mock.current().proxy_server.as_deref(),
@@ -878,6 +1079,7 @@ mod tests {
             proxy_enable: 1,
             proxy_server: Some("10.0.0.5:8080".into()),
             proxy_override: None,
+            wininet_flags: None,
         };
         let mock = MockProxyPlatform::new(corp);
 
@@ -904,6 +1106,7 @@ mod tests {
         mgr.enable(17890, &["*.local".into()]).unwrap();
         assert!(mgr.is_active());
         assert!(tmp_dir.join("sysproxy-backup.json").exists());
+        assert!(!tmp_dir.join("sysproxy-backup.json.tmp").exists());
 
         // Simulate crash (forget drop by creating a second manager while backup exists)
         let mut recovered_mgr = SystemProxyManager::new(&tmp_dir);
@@ -940,5 +1143,99 @@ mod tests {
         assert!(parts.contains(&"*.apple.com"));
         assert!(parts.contains(&"172.20.*"));
         assert!(parts.contains(&"169.254.*"));
+    }
+
+    #[test]
+    fn bypass_string_includes_full_rfc1918_172_16_through_31_range() {
+        let bypass = build_windows_bypass_string(&[]);
+        let parts: Vec<&str> = bypass.split(';').collect();
+        for second in 16..=31 {
+            let expected = format!("172.{second}.*");
+            assert!(
+                parts.contains(&expected.as_str()),
+                "missing RFC 1918 entry {expected} in {bypass}"
+            );
+        }
+        assert!(parts.contains(&"localhost"));
+        assert!(parts.contains(&"127.*"));
+        assert!(parts.contains(&"10.*"));
+        assert!(parts.contains(&"192.168.*"));
+        assert!(parts.contains(&"169.254.*"));
+        assert!(parts.contains(&"<local>"));
+    }
+
+    #[test]
+    fn strips_embedded_nul_bytes_from_backup_and_catches_nul_loopback() {
+        let corp_with_nul = SystemProxyBackup {
+            proxy_enable: 1,
+            proxy_server: Some("10.0.0.5\0:8080".into()),
+            proxy_override: Some("*.corp.internal\0;<local>".into()),
+            wininet_flags: Some(WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY),
+        };
+        let sanitized_corp = sanitize_backup(corp_with_nul);
+        assert_eq!(sanitized_corp.proxy_enable, 1);
+        assert_eq!(sanitized_corp.proxy_server.as_deref(), Some("10.0.0.5:8080"));
+        assert_eq!(
+            sanitized_corp.proxy_override.as_deref(),
+            Some("*.corp.internal;<local>")
+        );
+
+        let smuggled_loopback = SystemProxyBackup {
+            proxy_enable: 1,
+            proxy_server: Some("127.0.0.1\0:17890".into()),
+            proxy_override: Some("localhost\0".into()),
+            wininet_flags: None,
+        };
+        assert_eq!(sanitize_backup(smuggled_loopback), SystemProxyBackup::disabled());
+    }
+
+    #[test]
+    fn preserves_wininet_pac_and_wpad_flags_across_backup_and_restore() {
+        let tmp_dir = unique_tmp_dir("pac_wpad_flags");
+        let pac_wpad_flags = WININET_PROXY_TYPE_DIRECT
+            | WININET_PROXY_TYPE_AUTO_PROXY_URL
+            | WININET_PROXY_TYPE_AUTO_DETECT;
+
+        let initial = SystemProxyBackup {
+            proxy_enable: 0,
+            proxy_server: None,
+            proxy_override: None,
+            wininet_flags: Some(pac_wpad_flags),
+        };
+        let mock = MockProxyPlatform::new(initial.clone());
+
+        let mut mgr = SystemProxyManager::new(&tmp_dir);
+        mgr.enable_with(&mock, 17890, &[]).unwrap();
+
+        // While MaxQ is enabled, active flags are strictly DIRECT | PROXY
+        assert_eq!(
+            compute_wininet_flags(true, Some(pac_wpad_flags), None),
+            WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY
+        );
+
+        // Disconnecting restores original backup with PAC + WPAD flags intact
+        mgr.disable_and_restore_with(&mock).unwrap();
+        assert_eq!(mock.current(), initial);
+
+        // Verify flag restoration math preserves AUTO_PROXY_URL (0x4) and AUTO_DETECT (0x8)
+        let restored_disabled = compute_wininet_flags(
+            false,
+            Some(WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY),
+            Some(pac_wpad_flags | WININET_PROXY_TYPE_PROXY),
+        );
+        assert_eq!(restored_disabled, pac_wpad_flags);
+
+        // Restoring an enabled corporate proxy with PAC/WPAD preserves all flags + PROXY
+        let restored_corp = compute_wininet_flags(true, None, Some(pac_wpad_flags));
+        assert_eq!(restored_corp, pac_wpad_flags | WININET_PROXY_TYPE_PROXY);
+
+        // Legacy backup JSON without `wininet_flags` still deserializes cleanly
+        let legacy: SystemProxyBackup = serde_json::from_str(
+            r#"{"proxy_enable":0,"proxy_server":null,"proxy_override":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.wininet_flags, None);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

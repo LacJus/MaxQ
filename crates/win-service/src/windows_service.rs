@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{c_void, OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
@@ -8,7 +8,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,14 +20,23 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE, LUID, WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+    SetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, GetSecurityDescriptorDacl, LookupPrivilegeValueW, ACL,
+    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    PIPE_ACCESS_DUPLEX,
+    CreateFileW, GetFileInformationByHandle, ReadFile, WriteFile, BY_HANDLE_FILE_INFORMATION,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::JobObjects::{
@@ -40,17 +49,19 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, OpenProcess, QueryFullProcessImageNameW, ResetEvent, SetEvent,
-    WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::protocol::{
     ServiceRequest, ServiceResponse, TunServiceStatus, DIAGNOSTIC_STATUS_FILE,
-    DIAGNOSTIC_STATUS_SUBDIR, NAMED_PIPE_PATH, PIPE_SDDL, SERVICE_DESCRIPTION,
-    SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_PROTOCOL_VERSION, SING_BOX_V14_4_WIN64_SHA256,
+    DIAGNOSTIC_STATUS_SUBDIR, NAMED_PIPE_PATH, PIPE_CLIENT_ACCESS_MASK, PIPE_SDDL,
+    SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_PROTOCOL_VERSION,
+    SING_BOX_V14_4_WIN64_SHA256,
 };
 use crate::validator::{
-    is_authorized_caller_image, validate_service_config, verify_binary_sha256,
+    compute_file_sha256, is_authorized_caller_image, validate_service_config, verify_binary_sha256,
     CachedBinaryVerifier, MAX_CONFIG_BYTES,
 };
 
@@ -60,47 +71,37 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const MAX_LOGS: usize = 400;
 const PIPE_IO_TIMEOUT_MS: u32 = 10_000;
 
-struct ServiceChildJobGuard(HANDLE);
+/// LocalSystem well-known SID string used as authoritative NTFS owner on `%ProgramData%\MaxQ`.
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+/// Protected DACL granting Full Control strictly to LocalSystem (`SY`) and Administrators (`BA`).
+const SYSTEM_ADMIN_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const SYSTEM_ADMIN_FILE_SDDL: &str = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)";
+/// Protected DACL for `%ProgramData%\MaxQ\diagnostics` (SYSTEM/Admin full, Users read-only).
+const DIAGNOSTICS_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
+const DIAGNOSTICS_FILE_SDDL: &str = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)";
 
-unsafe impl Send for ServiceChildJobGuard {}
-unsafe impl Sync for ServiceChildJobGuard {}
+/// RAII wrapper around a Win32 kernel `HANDLE` ensuring all error paths close handles cleanly.
+struct OwnedHandle(HANDLE);
 
-impl ServiceChildJobGuard {
-    fn assign_kill_on_close(proc_handle: HANDLE) -> Option<Self> {
-        let job = unsafe { CreateJobObjectW(null(), null()) };
-        if job.is_null() {
-            return None;
+unsafe impl Send for OwnedHandle {}
+
+impl OwnedHandle {
+    fn new(handle: HANDLE) -> Option<Self> {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(Self(handle))
         }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok_set = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok_set == 0 {
-            unsafe {
-                CloseHandle(job);
-            }
-            return None;
-        }
-        let ok_assign = unsafe { AssignProcessToJobObject(job, proc_handle) };
-        if ok_assign == 0 {
-            unsafe {
-                CloseHandle(job);
-            }
-            return None;
-        }
-        Some(Self(job))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
     }
 }
 
-impl Drop for ServiceChildJobGuard {
+impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !self.0.is_null() {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             unsafe {
                 CloseHandle(self.0);
             }
@@ -109,12 +110,70 @@ impl Drop for ServiceChildJobGuard {
     }
 }
 
+/// RAII wrapper around a `LocalAlloc`-allocated Win32 pointer freed via `LocalFree`.
+struct LocalAllocGuard(*mut c_void);
+
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0);
+            }
+            self.0 = null_mut();
+        }
+    }
+}
+
+/// Clears and closes the shared `stop_event` under the Mutex when `run_service_loop` exits on
+/// any path, guaranteeing the SCM callback can never call `SetEvent` on a closed handle.
+struct StopEventSlotGuard(Arc<Mutex<Option<OwnedHandle>>>);
+
+impl Drop for StopEventSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.0.lock() {
+            slot.take();
+        }
+    }
+}
+
+struct ServiceChildJobGuard {
+    _job: OwnedHandle,
+}
+
+impl ServiceChildJobGuard {
+    fn assign_kill_on_close(proc_handle: HANDLE) -> Option<Self> {
+        let job = OwnedHandle::new(unsafe { CreateJobObjectW(null(), null()) })?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok_set = unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok_set == 0 {
+            return None;
+        }
+        let ok_assign = unsafe { AssignProcessToJobObject(job.raw(), proc_handle) };
+        if ok_assign == 0 {
+            return None;
+        }
+        Some(Self { _job: job })
+    }
+}
+
 struct ServiceRuntimeState {
     child: Option<Child>,
     job_guard: Option<ServiceChildJobGuard>,
     active_config_path: Option<PathBuf>,
     singbox_pid: Option<u32>,
+    active_profile_id: Option<String>,
+    active_node_id: Option<String>,
+    active_node_name: Option<String>,
     binary_verify_cache: CachedBinaryVerifier,
+    gui_verify_cache: CachedBinaryVerifier,
     logs: Arc<Mutex<VecDeque<String>>>,
     last_mitm_alert: Arc<Mutex<Option<String>>>,
 }
@@ -126,10 +185,21 @@ impl ServiceRuntimeState {
             job_guard: None,
             active_config_path: None,
             singbox_pid: None,
+            active_profile_id: None,
+            active_node_id: None,
+            active_node_name: None,
             binary_verify_cache: CachedBinaryVerifier::default(),
+            gui_verify_cache: CachedBinaryVerifier::default(),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOGS))),
             last_mitm_alert: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn clear_active_metadata(&mut self) {
+        self.singbox_pid = None;
+        self.active_profile_id = None;
+        self.active_node_id = None;
+        self.active_node_name = None;
     }
 
     fn stop_singbox(&mut self) {
@@ -141,20 +211,36 @@ impl ServiceRuntimeState {
         if let Some(cfg) = self.active_config_path.take() {
             let _ = std::fs::remove_file(cfg);
         }
-        self.singbox_pid = None;
+        self.clear_active_metadata();
     }
 
     fn is_singbox_running(&mut self) -> bool {
         if let Some(c) = self.child.as_mut() {
             match c.try_wait() {
                 Ok(None) => return true,
-                _ => {
+                Ok(Some(exit_status)) => {
+                    if let Ok(mut ring) = self.logs.lock() {
+                        if ring.len() >= MAX_LOGS {
+                            ring.pop_front();
+                        }
+                        ring.push_back(format!(
+                            "[maxq-service] sing-box TUN 进程已退出 ({exit_status})"
+                        ));
+                    }
                     self.child = None;
                     self.job_guard.take();
                     if let Some(cfg) = self.active_config_path.take() {
                         let _ = std::fs::remove_file(cfg);
                     }
-                    self.singbox_pid = None;
+                    self.clear_active_metadata();
+                }
+                Err(_) => {
+                    self.child = None;
+                    self.job_guard.take();
+                    if let Some(cfg) = self.active_config_path.take() {
+                        let _ = std::fs::remove_file(cfg);
+                    }
+                    self.clear_active_metadata();
                 }
             }
         }
@@ -171,6 +257,23 @@ pub fn install_and_start_service() -> Result<(), String> {
     res
 }
 
+/// Non-blocking poke on `NAMED_PIPE_PATH` to unblock any legacy v1.0.0 synchronous
+/// `ConnectNamedPipe` during in-place service upgrades.
+fn wake_legacy_named_pipe() {
+    let pipe_wide = to_wide_null(NAMED_PIPE_PATH);
+    let _handle = OwnedHandle::new(unsafe {
+        CreateFileW(
+            pipe_wide.as_ptr(),
+            PIPE_CLIENT_ACCESS_MASK,
+            0,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            null_mut(),
+        )
+    });
+}
+
 fn install_and_start_service_inner() -> Result<(), String> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -178,8 +281,8 @@ fn install_and_start_service_inner() -> Result<(), String> {
     )
     .map_err(|e| format!("打开 Windows 服务管理器失败（需要管理员权限）: {e}"))?;
 
-    let src_exe = strip_verbatim_prefix(
-        std::env::current_exe().map_err(|e| format!("无法获取当前服务路径: {e}"))?,
+    let src_exe = canonicalize_win_path(
+        &std::env::current_exe().map_err(|e| format!("无法获取当前服务路径: {e}"))?,
     );
     let src_dir = src_exe
         .parent()
@@ -202,22 +305,32 @@ fn install_and_start_service_inner() -> Result<(), String> {
         manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
     {
         let _ = existing.stop();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let stop_started = Instant::now();
+        let deadline = stop_started + Duration::from_secs(8);
+        let mut woke_legacy = false;
         while Instant::now() < deadline {
             if let Ok(st) = existing.query_status() {
                 if st.current_state == ServiceState::Stopped {
                     break;
                 }
             }
+            if !woke_legacy && stop_started.elapsed() >= Duration::from_secs(2) {
+                woke_legacy = true;
+                wake_legacy_named_pipe();
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
 
     if !paths_equal_ci(&src_exe, &staged_service) {
+        reject_if_reparse_or_hardlink(&staged_service)?;
         copy_with_retry(&src_exe, &staged_service, "maxq-service.exe")?;
+        lock_path_owner_and_dacl(&staged_service, SYSTEM_ADMIN_FILE_SDDL)?;
     }
     if !paths_equal_ci(&src_singbox, &staged_singbox) {
+        reject_if_reparse_or_hardlink(&staged_singbox)?;
         copy_with_retry(&src_singbox, &staged_singbox, "sing-box.exe")?;
+        lock_path_owner_and_dacl(&staged_singbox, SYSTEM_ADMIN_FILE_SDDL)?;
     }
 
     // Verify SHA-256 AFTER copying into SYSTEM-only directory to defeat TOCTOU swap (C-4)
@@ -226,8 +339,8 @@ fn install_and_start_service_inner() -> Result<(), String> {
         return Err(err);
     }
 
-    // Record the legitimate desktop installation directory in a SYSTEM-only file
-    let gui_root = if src_dir
+    // Record the canonicalized legitimate desktop installation directory in a SYSTEM-only file
+    let gui_root_raw = if src_dir
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.eq_ignore_ascii_case("resources"))
@@ -236,9 +349,30 @@ fn install_and_start_service_inner() -> Result<(), String> {
     } else {
         src_dir
     };
+    let gui_root = canonicalize_win_path(gui_root_raw);
     let meta_path = bin_dir.join("authorized-gui-dir.txt");
+    reject_if_reparse_or_hardlink(&meta_path)?;
     std::fs::write(&meta_path, gui_root.to_string_lossy().as_bytes())
         .map_err(|e| format!("写入 authorized-gui-dir.txt 失败: {e}"))?;
+    lock_path_owner_and_dacl(&meta_path, SYSTEM_ADMIN_FILE_SDDL)?;
+
+    // Also pin the GUI binary's SHA-256 (if present) so portable user-writable installs cannot be swapped
+    let gui_sha_path = bin_dir.join("authorized-gui-sha256.txt");
+    reject_if_reparse_or_hardlink(&gui_sha_path)?;
+    let gui_candidate = ["MaxQ.exe", "maxq-desktop.exe"]
+        .iter()
+        .map(|name| gui_root.join(name))
+        .find(|p| p.is_file());
+    if let Some(gui_exe) = gui_candidate {
+        reject_if_reparse_or_hardlink(&gui_exe)?;
+        let gui_sha = compute_file_sha256(&gui_exe)
+            .map_err(|e| format!("计算 GUI 二进制 SHA-256 失败: {e}"))?;
+        std::fs::write(&gui_sha_path, gui_sha.as_bytes())
+            .map_err(|e| format!("写入 authorized-gui-sha256.txt 失败: {e}"))?;
+        lock_path_owner_and_dacl(&gui_sha_path, SYSTEM_ADMIN_FILE_SDDL)?;
+    } else if gui_sha_path.exists() {
+        let _ = std::fs::remove_file(&gui_sha_path);
+    }
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -308,9 +442,9 @@ fn install_and_start_service_inner() -> Result<(), String> {
 
 pub fn stop_and_uninstall_service() -> Result<(), String> {
     let res = stop_and_uninstall_service_inner();
-    match &res {
-        Ok(()) => write_diagnostic_status("OK: MaxQTunService uninstalled"),
-        Err(err) => write_diagnostic_status(&format!("UNINSTALL_ERROR: {err}")),
+    // On Ok(()), DO NOT call write_diagnostic_status(...) which would recreate %ProgramData%\MaxQ\diagnostics
+    if let Err(err) = &res {
+        write_diagnostic_status(&format!("UNINSTALL_ERROR: {err}"));
     }
     res
 }
@@ -318,26 +452,45 @@ pub fn stop_and_uninstall_service() -> Result<(), String> {
 fn stop_and_uninstall_service_inner() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| format!("打开服务管理器失败（需要管理员权限）: {e}"))?;
-    let service = match manager.open_service(
+    if let Ok(service) = manager.open_service(
         SERVICE_NAME,
         ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
     ) {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
-    };
-    let _ = service.stop();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        if let Ok(st) = service.query_status() {
-            if st.current_state == ServiceState::Stopped {
-                break;
+        let _ = service.stop();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if let Ok(st) = service.query_status() {
+                if st.current_state == ServiceState::Stopped {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        service
+            .delete()
+            .map_err(|e| format!("删除 MaxQTunService 失败: {e}"))?;
+    }
+
+    // Best-effort cleanup of `%ProgramData%\MaxQ` subdirectories and root after uninstall
+    let root = program_data_maxq_root();
+    if root.exists() && reject_if_reparse_or_hardlink(&root).is_ok() {
+        for subdir in ["service-runtime", DIAGNOSTIC_STATUS_SUBDIR, "service-bin"] {
+            let target = root.join(subdir);
+            if !target.exists() || reject_if_reparse_or_hardlink(&target).is_err() {
+                continue;
+            }
+            for attempt in 0..3 {
+                if std::fs::remove_dir_all(&target).is_ok() {
+                    break;
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        let _ = std::fs::remove_dir(&root);
     }
-    service
-        .delete()
-        .map_err(|e| format!("删除 MaxQTunService 失败: {e}"))?;
+
     Ok(())
 }
 
@@ -361,15 +514,18 @@ fn run_service_loop() -> Result<(), String> {
     let runtime_for_handler = Arc::clone(&runtime);
 
     // Manual-reset stop event signaled by SCM Stop/Shutdown for instant race-free pipe wake
-    let stop_event = unsafe { CreateEventW(null(), 1, 0, null()) };
-    if stop_event.is_null() {
-        return Err(format!(
-            "CreateEventW(stop_event) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let stop_event_addr = Arc::new(AtomicUsize::new(stop_event as usize));
-    let stop_event_for_handler = Arc::clone(&stop_event_addr);
+    let stop_event = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) }).ok_or_else(
+        || {
+            format!(
+                "CreateEventW(stop_event) failed: {}",
+                std::io::Error::last_os_error()
+            )
+        },
+    )?;
+    let stop_event_raw = stop_event.raw();
+    let stop_event_slot = Arc::new(Mutex::new(Some(stop_event)));
+    let _stop_event_guard = StopEventSlotGuard(Arc::clone(&stop_event_slot));
+    let stop_event_for_handler = Arc::clone(&stop_event_slot);
 
     // Register SCM control handler FIRST so startup failures cleanly report ServiceState::Stopped
     let status_handle =
@@ -379,10 +535,11 @@ fn run_service_loop() -> Result<(), String> {
                 if let Ok(mut rt) = runtime_for_handler.lock() {
                     rt.stop_singbox();
                 }
-                let ev = stop_event_for_handler.load(Ordering::Acquire);
-                if ev != 0 {
-                    unsafe {
-                        SetEvent(ev as HANDLE);
+                if let Ok(guard) = stop_event_for_handler.lock() {
+                    if let Some(ev) = guard.as_ref() {
+                        unsafe {
+                            SetEvent(ev.raw());
+                        }
                     }
                 }
                 ServiceControlHandlerResult::NoError
@@ -392,32 +549,30 @@ fn run_service_loop() -> Result<(), String> {
         })
         .map_err(|e| format!("register SCM handler failed: {e}"))?;
 
-    let init_result = (|| -> Result<(HANDLE, HANDLE, PathBuf, PathBuf), String> {
+    let init_result = (|| -> Result<(OwnedHandle, OwnedHandle, PathBuf, PathBuf), String> {
         let pipe = create_hardened_named_pipe()?;
-        let connect_event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        if connect_event.is_null() {
-            unsafe {
-                CloseHandle(pipe);
-            }
-            return Err(format!(
-                "CreateEventW(connect_event) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let service_exe = strip_verbatim_prefix(
-            std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?,
+        let connect_event = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) })
+            .ok_or_else(|| {
+                format!(
+                    "CreateEventW(connect_event) failed: {}",
+                    std::io::Error::last_os_error()
+                )
+            })?;
+        let service_exe = canonicalize_win_path(
+            &std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?,
         );
         let runtime_dir = ensure_system_only_dir("service-runtime")?;
+        // Remove any stale active-tun.json left over from a prior power loss / BSOD
+        let stale_cfg = runtime_dir.join("active-tun.json");
+        if stale_cfg.exists() {
+            let _ = std::fs::remove_file(&stale_cfg);
+        }
         Ok((pipe, connect_event, service_exe, runtime_dir))
     })();
 
     let (pipe, connect_event, service_exe, runtime_dir) = match init_result {
         Ok(v) => v,
         Err(err) => {
-            stop_event_addr.store(0, Ordering::Release);
-            unsafe {
-                CloseHandle(stop_event);
-            }
             let _ = status_handle.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Stopped,
@@ -447,12 +602,12 @@ fn run_service_loop() -> Result<(), String> {
 
     while !stop_flag.load(Ordering::SeqCst) {
         unsafe {
-            ResetEvent(connect_event);
+            ResetEvent(connect_event.raw());
         }
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = connect_event;
+        ov.hEvent = connect_event.raw();
 
-        let ok = unsafe { ConnectNamedPipe(pipe, &mut ov) };
+        let ok = unsafe { ConnectNamedPipe(pipe.raw(), &mut ov) };
         let connected = if ok != 0 {
             true
         } else {
@@ -460,16 +615,19 @@ fn run_service_loop() -> Result<(), String> {
             if err == ERROR_PIPE_CONNECTED {
                 true
             } else if err == ERROR_IO_PENDING {
-                let handles = [connect_event, stop_event];
+                let handles = [connect_event.raw(), stop_event_raw];
                 let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
                 if wait == WAIT_OBJECT_0 {
                     let mut transferred = 0u32;
-                    unsafe { GetOverlappedResult(pipe, &ov, &mut transferred, 0) != 0 }
+                    unsafe { GetOverlappedResult(pipe.raw(), &ov, &mut transferred, 0) != 0 }
                 } else {
+                    // Unconditionally drain the IRP via GetOverlappedResult(..., 1) before `ov`
+                    // leaves the stack frame or `connect_event` is reset/closed.
                     unsafe {
-                        CancelIoEx(pipe, &ov);
+                        CancelIoEx(pipe.raw(), &ov);
+                        let mut dummy = 0u32;
+                        GetOverlappedResult(pipe.raw(), &ov, &mut dummy, 1) != 0
                     }
-                    false
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(50));
@@ -480,27 +638,23 @@ fn run_service_loop() -> Result<(), String> {
         if stop_flag.load(Ordering::SeqCst) {
             if connected {
                 unsafe {
-                    DisconnectNamedPipe(pipe);
+                    DisconnectNamedPipe(pipe.raw());
                 }
             }
             break;
         }
 
         if connected {
-            handle_pipe_client(pipe, &service_exe, &runtime_dir, &runtime);
+            handle_pipe_client(pipe.raw(), &service_exe, &runtime_dir, &runtime);
             unsafe {
-                FlushFileBuffers(pipe);
-                DisconnectNamedPipe(pipe);
+                DisconnectNamedPipe(pipe.raw());
             }
         }
     }
 
-    stop_event_addr.store(0, Ordering::Release);
-    unsafe {
-        CloseHandle(connect_event);
-        CloseHandle(pipe);
-        CloseHandle(stop_event);
-    }
+    drop(connect_event);
+    drop(pipe);
+    drop(_stop_event_guard);
 
     if let Ok(mut rt) = runtime.lock() {
         rt.stop_singbox();
@@ -525,17 +679,32 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+    if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", &s[8..]))
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
         PathBuf::from(stripped)
     } else {
         path
     }
 }
 
+fn canonicalize_win_path(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canon) => strip_verbatim_prefix(canon),
+        Err(_) => strip_verbatim_prefix(path.to_path_buf()),
+    }
+}
+
 fn paths_equal_ci(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .eq_ignore_ascii_case(b.to_string_lossy().trim_start_matches(r"\\?\"))
+    let norm_a = strip_verbatim_prefix(a.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase();
+    let norm_b = strip_verbatim_prefix(b.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase();
+    norm_a == norm_b
 }
 
 fn copy_with_retry(src: &Path, dst: &Path, label: &str) -> Result<(), String> {
@@ -554,7 +723,7 @@ fn copy_with_retry(src: &Path, dst: &Path, label: &str) -> Result<(), String> {
     Err(last_err)
 }
 
-fn create_hardened_named_pipe() -> Result<HANDLE, String> {
+fn create_hardened_named_pipe() -> Result<OwnedHandle, String> {
     let pipe_name = to_wide_null(NAMED_PIPE_PATH);
     let sddl_wide = to_wide_null(PIPE_SDDL);
     let mut sd_ptr = null_mut();
@@ -573,6 +742,7 @@ fn create_hardened_named_pipe() -> Result<HANDLE, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let _sd_guard = LocalAllocGuard(sd_ptr);
 
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -593,90 +763,133 @@ fn create_hardened_named_pipe() -> Result<HANDLE, String> {
         )
     };
 
-    unsafe {
-        LocalFree(sd_ptr);
-    }
-
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(format!(
+    OwnedHandle::new(handle).ok_or_else(|| {
+        format!(
             "CreateNamedPipeW failed (possible pipe squat): {}",
             std::io::Error::last_os_error()
-        ));
-    }
-    Ok(handle)
+        )
+    })
 }
 
-fn verify_pipe_caller_process(pipe: HANDLE, service_exe: &Path) -> Result<(), String> {
+fn verify_pipe_caller_process(
+    pipe: HANDLE,
+    service_exe: &Path,
+    runtime: &Arc<Mutex<ServiceRuntimeState>>,
+) -> Result<(), String> {
     let mut client_pid: u32 = 0;
     let ok = unsafe { GetNamedPipeClientProcessId(pipe, &mut client_pid) };
     if ok == 0 || client_pid == 0 {
         return Err("failed to query Named Pipe client PID".into());
     }
 
-    let proc_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) };
-    if proc_handle.is_null() {
-        return Err("failed to open client process for image path verification".into());
-    }
+    let proc_handle =
+        OwnedHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, client_pid) })
+            .ok_or_else(|| {
+                "failed to open client process for image path verification".to_string()
+            })?;
 
     let mut buf = vec![0u16; 4096];
     let mut len = buf.len() as u32;
-    let q_ok = unsafe { QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut len) };
-    unsafe {
-        CloseHandle(proc_handle);
-    }
+    let q_ok =
+        unsafe { QueryFullProcessImageNameW(proc_handle.raw(), 0, buf.as_mut_ptr(), &mut len) };
+    drop(proc_handle);
     if q_ok == 0 || len == 0 {
         return Err("failed to query client process image path".into());
     }
 
     let caller_str = String::from_utf16_lossy(&buf[..len as usize]);
-    let caller_path = PathBuf::from(&caller_str);
+    // Canonicalize via GetFinalPathNameByHandleW (std::fs::canonicalize) to resolve 8.3 short paths
+    // (e.g. PROGRA~1) and symlinks/junctions; fail closed if the backing binary cannot be resolved.
+    let caller_canon = std::fs::canonicalize(Path::new(&caller_str))
+        .map_err(|e| format!("failed to canonicalize IPC caller image '{caller_str}': {e}"))?;
+    let caller_path = strip_verbatim_prefix(caller_canon);
 
-    if is_authorized_caller_image(service_exe, &caller_path) {
+    // Always allow the staged service binary itself
+    if paths_equal_ci(&caller_path, service_exe) {
         return Ok(());
     }
-    if let Some(svc_dir) = service_exe.parent() {
-        if let Ok(gui_dir) = std::fs::read_to_string(svc_dir.join("authorized-gui-dir.txt")) {
-            let synthetic_svc = PathBuf::from(gui_dir.trim()).join("maxq-service.exe");
-            if is_authorized_caller_image(&synthetic_svc, &caller_path) {
-                return Ok(());
+
+    let mut path_authorized = is_authorized_caller_image(service_exe, &caller_path);
+    if !path_authorized {
+        if let Some(svc_dir) = service_exe.parent() {
+            if let Ok(gui_dir) = std::fs::read_to_string(svc_dir.join("authorized-gui-dir.txt")) {
+                let synthetic_svc = PathBuf::from(gui_dir.trim()).join("maxq-service.exe");
+                if is_authorized_caller_image(&synthetic_svc, &caller_path) {
+                    path_authorized = true;
+                }
             }
         }
     }
-    Err(format!("unauthorized IPC caller rejected: {caller_str}"))
+    if !path_authorized {
+        return Err(format!(
+            "unauthorized IPC caller rejected: {}",
+            caller_path.display()
+        ));
+    }
+
+    // If a pinned GUI SHA-256 digest was recorded during install, verify caller image digest
+    // via CachedBinaryVerifier so portable installs in user-writable dirs cannot be swapped.
+    if let Some(svc_dir) = service_exe.parent() {
+        let sha_file = svc_dir.join("authorized-gui-sha256.txt");
+        if sha_file.exists() {
+            let expected_sha = std::fs::read_to_string(&sha_file)
+                .map_err(|e| format!("failed reading authorized-gui-sha256.txt: {e}"))?;
+            let expected_trimmed = expected_sha.trim();
+            if expected_trimmed.is_empty() {
+                return Err("authorized-gui-sha256.txt is empty".into());
+            }
+            let mut rt = runtime.lock().unwrap_or_else(|e| e.into_inner());
+            if !rt.gui_verify_cache.is_verified(&caller_path, expected_trimmed) {
+                return Err(format!(
+                    "IPC caller binary SHA-256 mismatch rejected: {}",
+                    caller_path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn read_pipe_line_overlapped(pipe: HANDLE, max_bytes: usize) -> Result<String, String> {
-    let io_event = unsafe { CreateEventW(null(), 1, 0, null()) };
-    if io_event.is_null() {
-        return Err("CreateEventW(read) failed".into());
-    }
+    let io_event = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) })
+        .ok_or_else(|| "CreateEventW(read) failed".to_string())?;
     let mut acc = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
 
     let res = loop {
         unsafe {
-            ResetEvent(io_event);
+            ResetEvent(io_event.raw());
         }
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = io_event;
+        ov.hEvent = io_event.raw();
         let mut bytes_read = 0u32;
 
+        // Pass null_mut() for lpNumberOfBytesRead on overlapped handles and retrieve transferred
+        // count strictly via GetOverlappedResult to avoid asynchronous stack writes.
         let ok = unsafe {
             ReadFile(
                 pipe,
                 chunk.as_mut_ptr(),
                 chunk.len() as u32,
-                &mut bytes_read,
+                null_mut(),
                 &mut ov,
             )
         };
-        if ok == 0 {
+        if ok != 0 {
+            if unsafe { GetOverlappedResult(pipe, &ov, &mut bytes_read, 0) } == 0 {
+                break Err("IPC read GetOverlappedResult failed".into());
+            }
+        } else {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
             if err == ERROR_IO_PENDING {
-                let wait = unsafe { WaitForSingleObject(io_event, PIPE_IO_TIMEOUT_MS) };
+                let wait = unsafe { WaitForSingleObject(io_event.raw(), PIPE_IO_TIMEOUT_MS) };
                 if wait != WAIT_OBJECT_0 {
+                    // Unconditionally drain the canceled IRP before `ov`, `chunk`, or `io_event` drop.
                     unsafe {
                         CancelIoEx(pipe, &ov);
+                        let mut dummy = 0u32;
+                        GetOverlappedResult(pipe, &ov, &mut dummy, 1);
                     }
                     break Err("IPC read timeout".into());
                 }
@@ -705,18 +918,14 @@ fn read_pipe_line_overlapped(pipe: HANDLE, max_bytes: usize) -> Result<String, S
         acc.extend_from_slice(slice);
     };
 
-    unsafe {
-        CloseHandle(io_event);
-    }
     res?;
     String::from_utf8(acc).map_err(|_| "IPC request is not valid UTF-8".into())
 }
 
 fn write_pipe_line_overlapped(pipe: HANDLE, line: &str) {
-    let io_event = unsafe { CreateEventW(null(), 1, 0, null()) };
-    if io_event.is_null() {
+    let Some(io_event) = OwnedHandle::new(unsafe { CreateEventW(null(), 1, 0, null()) }) else {
         return;
-    }
+    };
     let mut payload = Vec::with_capacity(line.len() + 1);
     payload.extend_from_slice(line.as_bytes());
     payload.push(b'\n');
@@ -724,22 +933,31 @@ fn write_pipe_line_overlapped(pipe: HANDLE, line: &str) {
     let mut offset = 0usize;
     while offset < payload.len() {
         unsafe {
-            ResetEvent(io_event);
+            ResetEvent(io_event.raw());
         }
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = io_event;
+        ov.hEvent = io_event.raw();
         let mut written = 0u32;
         let rem = &payload[offset..];
         let to_write = rem.len().min(64 * 1024) as u32;
 
-        let ok = unsafe { WriteFile(pipe, rem.as_ptr(), to_write, &mut written, &mut ov) };
-        if ok == 0 {
+        // Pass null_mut() for lpNumberOfBytesWritten on overlapped handles and retrieve transferred
+        // count strictly via GetOverlappedResult to avoid asynchronous stack writes.
+        let ok = unsafe { WriteFile(pipe, rem.as_ptr(), to_write, null_mut(), &mut ov) };
+        if ok != 0 {
+            if unsafe { GetOverlappedResult(pipe, &ov, &mut written, 0) } == 0 {
+                break;
+            }
+        } else {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
             if err == ERROR_IO_PENDING {
-                let wait = unsafe { WaitForSingleObject(io_event, PIPE_IO_TIMEOUT_MS) };
+                let wait = unsafe { WaitForSingleObject(io_event.raw(), PIPE_IO_TIMEOUT_MS) };
                 if wait != WAIT_OBJECT_0 {
+                    // Unconditionally drain the canceled IRP before `ov`, `payload`, or `io_event` drop.
                     unsafe {
                         CancelIoEx(pipe, &ov);
+                        let mut dummy = 0u32;
+                        GetOverlappedResult(pipe, &ov, &mut dummy, 1);
                     }
                     break;
                 }
@@ -755,10 +973,6 @@ fn write_pipe_line_overlapped(pipe: HANDLE, line: &str) {
         }
         offset += written as usize;
     }
-
-    unsafe {
-        CloseHandle(io_event);
-    }
 }
 
 fn send_pipe_response(pipe: HANDLE, resp: &ServiceResponse) {
@@ -773,8 +987,9 @@ fn handle_pipe_client(
     runtime_dir: &Path,
     runtime: &Arc<Mutex<ServiceRuntimeState>>,
 ) {
-    if let Err(msg) = verify_pipe_caller_process(pipe, service_exe) {
-        send_pipe_response(pipe, &ServiceResponse::Error { message: msg });
+    // Reject unauthorized callers immediately WITHOUT writing to the pipe so the loop disconnects
+    // cleanly without blocking on a malicious client that never reads.
+    if verify_pipe_caller_process(pipe, service_exe, runtime).is_err() {
         return;
     }
 
@@ -833,6 +1048,9 @@ fn handle_pipe_client(
                 last_mitm_alert: last_alert,
                 version: Some(SERVICE_PROTOCOL_VERSION.to_string()),
                 last_error: None,
+                active_profile_id: rt.active_profile_id.clone(),
+                active_node_id: rt.active_node_id.clone(),
+                active_node_name: rt.active_node_name.clone(),
             })
         }
         ServiceRequest::StopTun => {
@@ -851,12 +1069,23 @@ fn handle_pipe_client(
                 .collect();
             ServiceResponse::Logs { lines }
         }
-        ServiceRequest::StartTun { config_json } => {
-            match start_hardened_singbox_tun(&singbox_path, runtime_dir, &config_json, runtime) {
-                Ok(pid) => ServiceResponse::Started { pid },
-                Err(message) => ServiceResponse::Error { message },
-            }
-        }
+        ServiceRequest::StartTun {
+            config_json,
+            active_profile_id,
+            active_node_id,
+            active_node_name,
+        } => match start_hardened_singbox_tun(
+            &singbox_path,
+            runtime_dir,
+            &config_json,
+            active_profile_id,
+            active_node_id,
+            active_node_name,
+            runtime,
+        ) {
+            Ok(pid) => ServiceResponse::Started { pid },
+            Err(message) => ServiceResponse::Error { message },
+        },
     };
 
     send_pipe_response(pipe, &resp);
@@ -866,6 +1095,9 @@ fn start_hardened_singbox_tun(
     singbox_path: &Path,
     runtime_dir: &Path,
     config_json: &str,
+    active_profile_id: Option<String>,
+    active_node_id: Option<String>,
+    active_node_name: Option<String>,
     runtime: &Arc<Mutex<ServiceRuntimeState>>,
 ) -> Result<u32, String> {
     let validated = validate_service_config(config_json)?;
@@ -887,6 +1119,7 @@ fn start_hardened_singbox_tun(
     };
 
     let cfg_path = runtime_dir.join("active-tun.json");
+    reject_if_reparse_or_hardlink(&cfg_path)?;
     let pretty = serde_json::to_string_pretty(&validated).map_err(|e| e.to_string())?;
     std::fs::write(&cfg_path, pretty.as_bytes())
         .map_err(|e| format!("failed to write active-tun.json: {e}"))?;
@@ -931,6 +1164,9 @@ fn start_hardened_singbox_tun(
     rt.job_guard = job_guard;
     rt.active_config_path = Some(cfg_path);
     rt.singbox_pid = Some(pid);
+    rt.active_profile_id = active_profile_id;
+    rt.active_node_id = active_node_id;
+    rt.active_node_name = active_node_name;
     Ok(pid)
 }
 
@@ -958,20 +1194,183 @@ fn spawn_service_log_thread<R: std::io::Read + Send + 'static>(
     });
 }
 
-fn reject_if_reparse_point(path: &Path) -> Result<(), String> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink()
-            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-        {
-            return Err(format!("refusing symlink/junction at '{}'", path.display()));
+/// Rejects symlinks, NTFS junctions/reparse points, and hardlinked files (`nNumberOfLinks > 1`)
+/// to prevent pre-created file/directory LPE attacks under `%ProgramData%\MaxQ`.
+fn reject_if_reparse_or_hardlink(path: &Path) -> Result<(), String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "failed inspecting metadata for '{}': {e}",
+                path.display()
+            ));
+        }
+    };
+    if meta.file_type().is_symlink()
+        || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(format!("refusing symlink/junction at '{}'", path.display()));
+    }
+    if meta.is_file() {
+        let wide = to_wide_null(&path.to_string_lossy());
+        let handle = OwnedHandle::new(unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        })
+        .ok_or_else(|| {
+            format!(
+                "failed opening '{}' for hardlink verification: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )
+        })?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle.raw(), &mut info) };
+        if ok == 0 {
+            return Err(format!(
+                "GetFileInformationByHandle failed for '{}': {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(format!("refusing reparse point at '{}'", path.display()));
+        }
+        if info.nNumberOfLinks > 1 {
+            return Err(format!(
+                "refusing hardlinked file '{}' (nNumberOfLinks={})",
+                path.display(),
+                info.nNumberOfLinks
+            ));
         }
     }
     Ok(())
 }
 
-fn icacls_exe_path() -> PathBuf {
-    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    PathBuf::from(sys_root).join("System32").join("icacls.exe")
+/// Enables `SeRestorePrivilege` and `SeTakeOwnershipPrivilege` on the current process token
+/// (best-effort) so elevated Administrators as well as LocalSystem can atomically assign
+/// `Owner = S-1-5-18 (LocalSystem)` via `SetNamedSecurityInfoW`.
+fn enable_security_privileges() {
+    let mut raw_token: HANDLE = null_mut();
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut raw_token,
+        )
+    };
+    if ok == 0 {
+        return;
+    }
+    let Some(token) = OwnedHandle::new(raw_token) else {
+        return;
+    };
+    for priv_name in ["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+        let priv_wide = to_wide_null(priv_name);
+        let mut luid: LUID = unsafe { std::mem::zeroed() };
+        if unsafe { LookupPrivilegeValueW(null(), priv_wide.as_ptr(), &mut luid) } == 0 {
+            continue;
+        }
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        unsafe {
+            AdjustTokenPrivileges(
+                token.raw(),
+                0,
+                &tp,
+                0,
+                null_mut(),
+                null_mut(),
+            );
+        }
+    }
+}
+
+/// Atomically sets `Owner = S-1-5-18 (LocalSystem)` and replaces the entire DACL with a protected
+/// SDDL DACL using `SetNamedSecurityInfoW`, strictly checking for `ERROR_SUCCESS`.
+fn lock_path_owner_and_dacl(path: &Path, dacl_sddl: &str) -> Result<(), String> {
+    enable_security_privileges();
+
+    let sid_wide = to_wide_null(LOCAL_SYSTEM_SID);
+    let mut owner_sid: PSID = null_mut();
+    if unsafe { ConvertStringSidToSidW(sid_wide.as_ptr(), &mut owner_sid) } == 0
+        || owner_sid.is_null()
+    {
+        return Err(format!(
+            "ConvertStringSidToSidW(S-1-5-18) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _owner_sid_guard = LocalAllocGuard(owner_sid);
+
+    let sddl_wide = to_wide_null(dacl_sddl);
+    let mut sd_ptr: *mut c_void = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd_ptr,
+            null_mut(),
+        )
+    } == 0
+        || sd_ptr.is_null()
+    {
+        return Err(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed for '{dacl_sddl}': {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _sd_guard = LocalAllocGuard(sd_ptr);
+
+    let mut dacl_present = 0i32;
+    let mut dacl_ptr: *mut ACL = null_mut();
+    let mut dacl_defaulted = 0i32;
+    if unsafe {
+        GetSecurityDescriptorDacl(sd_ptr, &mut dacl_present, &mut dacl_ptr, &mut dacl_defaulted)
+    } == 0
+        || dacl_present == 0
+        || dacl_ptr.is_null()
+    {
+        return Err(format!(
+            "GetSecurityDescriptorDacl failed for '{dacl_sddl}': {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut path_wide = to_wide_null(&path.to_string_lossy());
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner_sid,
+            null_mut(),
+            dacl_ptr,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "SetNamedSecurityInfoW failed on '{}' (win32_error={status})",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn program_data_maxq_root() -> PathBuf {
@@ -980,16 +1379,16 @@ fn program_data_maxq_root() -> PathBuf {
 }
 
 /// Writes non-secret install/service diagnostics to `%ProgramData%\MaxQ\diagnostics\last-status.txt`
-/// (writable ONLY by SYSTEM + Administrators, read-only for Users so the non-elevated GUI can
-/// display exact error reasons instead of failing silently).
+/// (Owner=SYSTEM, writable ONLY by SYSTEM + Administrators, read-only for Users so the non-elevated
+/// GUI can display exact error reasons instead of failing silently).
 fn write_diagnostic_status(message: &str) {
     let root = program_data_maxq_root();
     let diag_dir = root.join(DIAGNOSTIC_STATUS_SUBDIR);
     let diag_file = diag_dir.join(DIAGNOSTIC_STATUS_FILE);
 
-    if reject_if_reparse_point(&root).is_err()
-        || reject_if_reparse_point(&diag_dir).is_err()
-        || reject_if_reparse_point(&diag_file).is_err()
+    if reject_if_reparse_or_hardlink(&root).is_err()
+        || reject_if_reparse_or_hardlink(&diag_dir).is_err()
+        || reject_if_reparse_or_hardlink(&diag_file).is_err()
     {
         return;
     }
@@ -997,75 +1396,48 @@ fn write_diagnostic_status(message: &str) {
         return;
     }
 
-    let icacls = icacls_exe_path();
-    let _ = Command::new(&icacls)
-        .arg(&diag_dir)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "/grant:r",
-            "*S-1-5-32-545:(OI)(CI)R",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    // Lock `%ProgramData%\MaxQ` root FIRST, then apply read-only-for-Users DACL to `diagnostics`.
+    if lock_path_owner_and_dacl(&root, SYSTEM_ADMIN_DIR_SDDL).is_err() {
+        return;
+    }
+    if lock_path_owner_and_dacl(&diag_dir, DIAGNOSTICS_DIR_SDDL).is_err() {
+        return;
+    }
 
-    if reject_if_reparse_point(&diag_file).is_ok() {
-        let _ = std::fs::write(&diag_file, message.as_bytes());
+    if reject_if_reparse_or_hardlink(&diag_file).is_ok() {
+        if std::fs::write(&diag_file, message.as_bytes()).is_ok() {
+            let _ = lock_path_owner_and_dacl(&diag_file, DIAGNOSTICS_FILE_SDDL);
+        }
     }
 }
 
-/// Ensures `C:\ProgramData\MaxQ\<subdir>` exists without symlinks/junctions and is ACL-locked to
-/// SYSTEM + Administrators only (using absolute System32\icacls.exe and locale-independent SIDs).
+/// Ensures `C:\ProgramData\MaxQ\<subdir>` exists without symlinks/junctions/hardlinks and is
+/// atomically owned by LocalSystem (`S-1-5-18`) with a protected SYSTEM+Administrators-only DACL.
 fn ensure_system_only_dir(subdir: &str) -> Result<PathBuf, String> {
     let root = program_data_maxq_root();
     let dir = root.join(subdir);
 
-    // Reject NTFS junctions/symlinks (FILE_ATTRIBUTE_REPARSE_POINT) before writing as SYSTEM (C-3)
-    reject_if_reparse_point(&root)?;
-    reject_if_reparse_point(&dir)?;
+    // Reject NTFS junctions/symlinks/hardlinks before creating or writing as SYSTEM (C-3)
+    reject_if_reparse_or_hardlink(&root)?;
+    reject_if_reparse_or_hardlink(&dir)?;
 
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {subdir} 目录失败: {e}"))?;
 
-    let icacls_exe = icacls_exe_path();
-    for target in [&root, &dir] {
-        let out = Command::new(&icacls_exe)
-            .arg(target)
-            .args([
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",
-                "/grant:r",
-                "*S-1-5-32-544:(OI)(CI)F",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("执行 icacls.exe 失败: {e}"))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return Err(format!(
-                "icacls.exe 锁定 '{}' 失败 (status={}): {} {}",
-                target.display(),
-                out.status,
-                stdout.trim(),
-                stderr.trim()
-            ));
-        }
-    }
+    // Atomically enforce Owner=LocalSystem + protected DACL on root first, then subdir
+    lock_path_owner_and_dacl(&root, SYSTEM_ADMIN_DIR_SDDL)?;
+    lock_path_owner_and_dacl(&dir, SYSTEM_ADMIN_DIR_SDDL)?;
 
-    // Also strip any pre-existing explicit permissive ACEs on existing entries inside `dir`
+    // Reject reparse points / hardlinks and replace owner+DACL on any pre-existing entries inside `dir`
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            reject_if_reparse_point(&p)?;
-            let _ = Command::new(&icacls_exe)
-                .arg(&p)
-                .args(["/reset"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            reject_if_reparse_or_hardlink(&p)?;
+            let sddl = if p.is_dir() {
+                SYSTEM_ADMIN_DIR_SDDL
+            } else {
+                SYSTEM_ADMIN_FILE_SDDL
+            };
+            lock_path_owner_and_dacl(&p, sddl)?;
         }
     }
 

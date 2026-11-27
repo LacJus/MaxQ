@@ -42,7 +42,21 @@ impl TunServiceClient {
     }
 
     pub fn start_tun(config_json: String) -> Result<u32, RuntimeError> {
-        match send_request(&ServiceRequest::StartTun { config_json })? {
+        Self::start_tun_with_meta(config_json, None, None, None)
+    }
+
+    pub fn start_tun_with_meta(
+        config_json: String,
+        active_profile_id: Option<String>,
+        active_node_id: Option<String>,
+        active_node_name: Option<String>,
+    ) -> Result<u32, RuntimeError> {
+        match send_request(&ServiceRequest::StartTun {
+            config_json,
+            active_profile_id,
+            active_node_id,
+            active_node_name,
+        })? {
             ServiceResponse::Started { pid } => Ok(pid),
             ServiceResponse::Error { message } => Err(RuntimeError::SpawnFailed(message)),
             other => Err(RuntimeError::SpawnFailed(format!(
@@ -236,11 +250,25 @@ fn send_request(_req: &ServiceRequest) -> Result<ServiceResponse, RuntimeError> 
     ))
 }
 
+#[cfg(any(windows, test))]
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(after_prefix) = raw.strip_prefix(r"\\?\") {
+        if after_prefix
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"UNC\"))
+        {
+            return std::path::PathBuf::from(format!(r"\\{}", &after_prefix[4..]));
+        }
+        return std::path::PathBuf::from(after_prefix);
+    }
+    path.to_path_buf()
+}
+
 #[cfg(windows)]
 fn run_elevated_service_cmd(service_exe: &Path, arg: &str) -> Result<(), RuntimeError> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::PathBuf;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
@@ -249,13 +277,9 @@ fn run_elevated_service_cmd(service_exe: &Path, arg: &str) -> Result<(), Runtime
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-    // Strip Tauri/Windows verbatim `\\?\` prefix so ShellExecuteExW resolves the binary cleanly
-    let raw_str = service_exe.to_string_lossy();
-    let cleaned_exe = if let Some(stripped) = raw_str.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        service_exe.to_path_buf()
-    };
+    // Strip Tauri/Windows verbatim `\\?\` prefix (mapping `\\?\UNC\server\share` -> `\\server\share`)
+    // so ShellExecuteExW resolves the binary cleanly.
+    let cleaned_exe = strip_verbatim_prefix(service_exe);
 
     if !cleaned_exe.is_absolute() || !cleaned_exe.exists() {
         return Err(RuntimeError::BinaryNotFound(cleaned_exe));
@@ -314,4 +338,29 @@ fn run_elevated_service_cmd(_service_exe: &Path, _arg: &str) -> Result<(), Runti
     Err(RuntimeError::SpawnFailed(
         "Windows TUN service installation is only available on Windows".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_verbatim_prefix_handles_unc_and_drive_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\fileserver\share\maxq-service.exe")),
+            std::path::PathBuf::from(r"\\fileserver\share\maxq-service.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\unc\fileserver\share\maxq-service.exe")),
+            std::path::PathBuf::from(r"\\fileserver\share\maxq-service.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Program Files\MaxQ\maxq-service.exe")),
+            std::path::PathBuf::from(r"C:\Program Files\MaxQ\maxq-service.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\Program Files\MaxQ\maxq-service.exe")),
+            std::path::PathBuf::from(r"C:\Program Files\MaxQ\maxq-service.exe")
+        );
+    }
 }

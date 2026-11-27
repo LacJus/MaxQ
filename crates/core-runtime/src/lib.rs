@@ -59,6 +59,8 @@ pub enum RuntimeEvent {
 pub struct RuntimeStatus {
     pub running: bool,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
     pub active_node_id: Option<String>,
     pub active_node_name: Option<String>,
     pub clash_api_port: Option<u16>,
@@ -74,6 +76,7 @@ impl Default for RuntimeStatus {
         Self {
             running: false,
             pid: None,
+            active_profile_id: None,
             active_node_id: None,
             active_node_name: None,
             clash_api_port: None,
@@ -208,10 +211,38 @@ impl SingBoxSupervisor {
         mixed_port: u16,
         clash_api_port: u16,
     ) -> Result<u32, RuntimeError> {
+        self.start_for_profile(None, node_id, node_name, compiled, mixed_port, clash_api_port)
+            .await
+    }
+
+    /// Writes the compiled `sing-box` config into the app-owned runtime directory and spawns `sing-box run`,
+    /// recording the originating `profile_id` alongside the active node metadata.
+    pub async fn start_for_profile(
+        &mut self,
+        profile_id: Option<String>,
+        node_id: String,
+        node_name: String,
+        compiled: &CompiledConfig,
+        mixed_port: u16,
+        clash_api_port: u16,
+    ) -> Result<u32, RuntimeError> {
         self.stop().await?;
 
         if !self.singbox_path.exists() {
             return Err(RuntimeError::BinaryNotFound(self.singbox_path.clone()));
+        }
+
+        #[cfg(windows)]
+        {
+            maxq_win_service::validator::verify_binary_sha256(
+                &self.singbox_path,
+                maxq_win_service::protocol::SING_BOX_V14_4_WIN64_SHA256,
+            )
+            .map_err(|reason| {
+                RuntimeError::SpawnFailed(format!(
+                    "sing-box.exe SHA-256 完整性校验失败，拒绝启动: {reason}"
+                ))
+            })?;
         }
 
         std::fs::create_dir_all(&self.runtime_dir)?;
@@ -300,6 +331,7 @@ impl SingBoxSupervisor {
             let mut st = self.status.lock().unwrap();
             st.running = true;
             st.pid = Some(pid);
+            st.active_profile_id = profile_id;
             st.active_node_id = Some(node_id);
             st.active_node_name = Some(node_name);
             st.clash_api_port = Some(clash_api_port);
@@ -339,6 +371,7 @@ impl SingBoxSupervisor {
         if let Ok(mut st) = self.status.lock() {
             st.running = false;
             st.pid = None;
+            st.active_profile_id = None;
         }
         let _ = self.events_tx.send(RuntimeEvent::Stopped {
             exit_code: exited.flatten(),
@@ -368,6 +401,7 @@ impl SingBoxSupervisor {
                 let mut st = self.status.lock().unwrap();
                 st.running = false;
                 st.pid = None;
+                st.active_profile_id = None;
             }
             self.clash_api_secret = None;
             let _ = self.events_tx.send(RuntimeEvent::Stopped { exit_code });
@@ -393,6 +427,7 @@ impl SingBoxSupervisor {
             if let Ok(mut st) = self.status.lock() {
                 st.running = false;
                 st.pid = None;
+                st.active_profile_id = None;
             }
             self.clash_api_secret = None;
             let _ = self.events_tx.send(RuntimeEvent::Stopped { exit_code: None });
@@ -428,7 +463,7 @@ impl SingleInstanceGuard {
             use std::os::windows::ffi::OsStrExt;
             use std::ptr::null;
             use windows_sys::Win32::Foundation::{
-                CloseHandle, GetLastError, ERROR_ALREADY_EXISTS,
+                CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
             };
             use windows_sys::Win32::System::Threading::CreateMutexW;
             use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -441,10 +476,25 @@ impl SingleInstanceGuard {
                     .chain(std::iter::once(0))
                     .collect()
             };
+            let focus_existing = || {
+                let title_wide = to_wide(window_title);
+                let hwnd = unsafe { FindWindowW(null(), title_wide.as_ptr()) };
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+            };
             let mutex_name = to_wide(r"Local\MaxQDesktopSingleInstanceMutex");
             let handle = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
             if handle.is_null() {
-                // Fail open if OS refuses mutex creation so app still starts
+                let raw_err = std::io::Error::last_os_error().raw_os_error();
+                if raw_err == Some(ERROR_ACCESS_DENIED as i32) {
+                    focus_existing();
+                    return None;
+                }
+                // Fail open if OS refuses mutex creation for non-permission reasons so app still starts
                 return Some(Self {
                     handle: std::ptr::null_mut(),
                 });
@@ -454,14 +504,7 @@ impl SingleInstanceGuard {
                 unsafe {
                     CloseHandle(handle);
                 }
-                let title_wide = to_wide(window_title);
-                let hwnd = unsafe { FindWindowW(null(), title_wide.as_ptr()) };
-                if !hwnd.is_null() {
-                    unsafe {
-                        ShowWindow(hwnd, SW_RESTORE);
-                        SetForegroundWindow(hwnd);
-                    }
-                }
+                focus_existing();
                 return None;
             }
             Some(Self { handle })

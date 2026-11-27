@@ -60,6 +60,8 @@ pub enum ProbeError {
     MissingImportedPin,
     #[error("CRITICAL: imported leaf cert SHA-256 pin mismatch! expected={expected}, observed={observed}")]
     ImportedPinMismatch { expected: String, observed: String },
+    #[error("VLESS Reality 节点使用 Reality 公钥认证，不能绑定常规 TLS SPKI 证书指纹")]
+    RealityPinNotSupported,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,15 @@ pub struct ProbeRequest {
     pub timeout_ms: u64,
 }
 
+fn strip_ip_brackets(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 impl ProbeRequest {
     pub fn from_node(node: &NodeConfig) -> Self {
         let transport = match &node.protocol {
@@ -124,9 +135,9 @@ impl ProbeRequest {
         }
 
         Self {
-            host: node.effective_dial_server().to_string(),
+            host: strip_ip_brackets(node.effective_dial_server()),
             port: node.server_port,
-            sni: node.effective_sni().to_string(),
+            sni: strip_ip_brackets(node.effective_sni()),
             alpn,
             transport,
             timeout_ms: 8_000,
@@ -180,6 +191,7 @@ pub struct PinEvaluation {
 }
 
 /// Evaluates a freshly probed certificate against an existing `NodeConfig`:
+/// - Rejects VLESS Reality nodes (which authenticate via Reality public key, not TLS SPKI).
 /// - `PendingPinBootstrap`: fails closed if `imported_cert_sha256_hex` is missing/invalid (C-3),
 ///   and verifies `SHA256(leaf_DER) == imported_cert_sha256_hex` before deriving `spki_sha256_b64`.
 /// - `PinnedSpki`: detects SPKI drift / potential MITM without auto-rotating.
@@ -187,6 +199,9 @@ pub fn evaluate_probe_against_node(
     node: &NodeConfig,
     probed: &ProbedCertificate,
 ) -> Result<PinEvaluation, ProbeError> {
+    if node.tls.reality.is_some() {
+        return Err(ProbeError::RealityPinNotSupported);
+    }
     match &node.tls.verify_mode {
         TlsVerifyMode::PendingPinBootstrap => {
             let expected_hex = node
@@ -242,15 +257,21 @@ pub fn evaluate_probe_against_node(
 }
 
 pub fn apply_confirmed_pin(node: &mut NodeConfig, record: TrustRecord) {
+    if node.tls.reality.is_some() {
+        return;
+    }
     node.tls.enabled = true;
+    let normalized_sni = strip_ip_brackets(&record.sni);
+    let sni_is_ip = normalized_sni.parse::<IpAddr>().is_ok();
     if node
         .tls
         .server_name
         .as_deref()
         .map_or(true, |s| s.trim().is_empty())
-        && !record.sni.is_empty()
+        && !normalized_sni.is_empty()
+        && !sni_is_ip
     {
-        node.tls.server_name = Some(record.sni.clone());
+        node.tls.server_name = Some(normalized_sni);
     }
     node.tls.verify_mode = TlsVerifyMode::PinnedSpki;
     node.tls.trust_record = Some(record);
@@ -309,7 +330,8 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
             req.host, req.port
         )));
     }
-    if req.sni.trim().is_empty() {
+    let clean_sni = strip_ip_brackets(&req.sni);
+    if clean_sni.is_empty() {
         return Err(ProbeError::InvalidServerName(req.sni.clone()));
     }
 
@@ -337,7 +359,7 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
 
     match &req.transport {
         ProbeTransport::TcpTls => {
-            let server_name = ServerName::try_from(req.sni.clone())
+            let server_name = ServerName::try_from(clean_sni.clone())
                 .map_err(|_| ProbeError::InvalidServerName(req.sni.clone()))?;
             let tcp = TcpStream::connect(target_addr)
                 .await
@@ -361,7 +383,7 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
                     Ok(_) => ProbeError::SignatureNotVerified,
                 });
             }
-            parse_leaf_cert_der(&leaf, &req.sni, chain_len)
+            parse_leaf_cert_der(&leaf, &clean_sni, chain_len)
         }
         ProbeTransport::Quic {
             salamander_password,
@@ -397,7 +419,7 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
             };
 
             let connecting = endpoint
-                .connect_with(client_cfg, target_addr, &req.sni)
+                .connect_with(client_cfg, target_addr, &clean_sni)
                 .map_err(|e| ProbeError::QuicHandshake(e.to_string()))?;
             let handshake_res = connecting.await;
             endpoint.close(0u32.into(), b"probe-done");
@@ -418,7 +440,7 @@ async fn probe_certificate_inner(req: &ProbeRequest) -> Result<ProbedCertificate
                     Ok(_) => ProbeError::SignatureNotVerified,
                 });
             }
-            parse_leaf_cert_der(&leaf, &req.sni, chain_len)
+            parse_leaf_cert_der(&leaf, &clean_sni, chain_len)
         }
     }
 }
@@ -606,5 +628,134 @@ impl ServerCertVerifier for CapturingCertVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algs.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maxq_core_model::RealityConfig;
+
+    fn sample_probed(sni: &str) -> ProbedCertificate {
+        ProbedCertificate {
+            spki_sha256_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into(),
+            cert_sha256_hex: "a".repeat(64),
+            cert_sha256_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into(),
+            sni: sni.to_string(),
+            subject: format!("CN={sni}"),
+            issuer: format!("CN={sni}"),
+            san_dns: vec![],
+            san_ip: vec![],
+            not_before: "2026-01-01".into(),
+            not_after: "2027-01-01".into(),
+            is_self_signed: true,
+            hostname_matches_sni: true,
+            chain_len: 1,
+        }
+    }
+
+    #[test]
+    fn from_node_strips_ipv6_brackets_for_host_and_sni() {
+        let mut node = NodeConfig::new(
+            "IPv6-Trojan",
+            "[2001:db8::1]",
+            443,
+            ProtocolConfig::Trojan {
+                password: "pw".into(),
+            },
+        );
+        node.tls.enabled = true;
+        node.tls.server_name = Some("[2001:db8::2]".into());
+
+        let req = ProbeRequest::from_node(&node);
+        assert_eq!(req.host, "2001:db8::1");
+        assert_eq!(req.sni, "2001:db8::2");
+        let parsed = ServerName::try_from(req.sni.clone()).expect("unbracketed IPv6 must parse");
+        assert!(matches!(parsed, ServerName::IpAddress(_)));
+
+        // Also when server_name is None (falls back to bracketed server)
+        node.tls.server_name = None;
+        let req_fallback = ProbeRequest::from_node(&node);
+        assert_eq!(req_fallback.sni, "2001:db8::1");
+        assert!(matches!(
+            ServerName::try_from(req_fallback.sni),
+            Ok(ServerName::IpAddress(_))
+        ));
+    }
+
+    #[test]
+    fn apply_confirmed_pin_does_not_write_ip_literal_into_server_name() {
+        for ip_sni in ["203.0.113.10", "2001:db8::1", "[2001:db8::1]", ""] {
+            let mut node = NodeConfig::new(
+                "IP-Node",
+                "203.0.113.10",
+                443,
+                ProtocolConfig::Trojan {
+                    password: "pw".into(),
+                },
+            );
+            node.tls.enabled = true;
+            node.tls.server_name = None;
+            let rec = sample_probed(ip_sni).into_trust_record(TrustOrigin::TofuProbe);
+
+            apply_confirmed_pin(&mut node, rec);
+            assert_eq!(
+                node.tls.server_name, None,
+                "IP literal or empty SNI '{ip_sni}' must not populate tls.server_name"
+            );
+            assert_eq!(node.tls.verify_mode, TlsVerifyMode::PinnedSpki);
+            assert!(node.tls.trust_record.is_some());
+        }
+
+        // Legitimate domain SNI still populates empty server_name
+        let mut domain_node = NodeConfig::new(
+            "Domain-Node",
+            "edge.example.com",
+            443,
+            ProtocolConfig::Trojan {
+                password: "pw".into(),
+            },
+        );
+        domain_node.tls.enabled = true;
+        domain_node.tls.server_name = None;
+        let domain_rec = sample_probed("edge.example.com").into_trust_record(TrustOrigin::TofuProbe);
+        apply_confirmed_pin(&mut domain_node, domain_rec);
+        assert_eq!(
+            domain_node.tls.server_name.as_deref(),
+            Some("edge.example.com")
+        );
+    }
+
+    #[test]
+    fn rejects_spki_pinning_for_vless_reality_nodes() {
+        let mut node = NodeConfig::new(
+            "VLESS-Reality",
+            "reality.example.com",
+            443,
+            ProtocolConfig::Vless {
+                uuid: "11111111-1111-1111-1111-111111111111".into(),
+                flow: Some("xtls-rprx-vision".into()),
+                packet_encoding: None,
+            },
+        );
+        node.tls.enabled = true;
+        node.tls.server_name = Some("www.microsoft.com".into());
+        node.tls.reality = Some(RealityConfig {
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            short_id: "01234567".into(),
+        });
+
+        let probed = sample_probed("www.microsoft.com");
+        let err = evaluate_probe_against_node(&node, &probed).unwrap_err();
+        assert!(matches!(err, ProbeError::RealityPinNotSupported));
+        assert!(err
+            .to_string()
+            .contains("VLESS Reality 节点使用 Reality 公钥认证，不能绑定常规 TLS SPKI 证书指纹"));
+
+        // apply_confirmed_pin also refuses to mutate a Reality node
+        let rec = probed.into_trust_record(TrustOrigin::TofuProbe);
+        apply_confirmed_pin(&mut node, rec);
+        assert_eq!(node.tls.verify_mode, TlsVerifyMode::SystemCa);
+        assert!(node.tls.trust_record.is_none());
     }
 }
